@@ -810,7 +810,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "port_check",
- "quick-xml 0.38.3",
+ "quick-xml 0.39.0",
  "rand 0.9.2",
  "regex",
  "reqwest",
@@ -3386,6 +3386,16 @@ name = "quick-xml"
 version = "0.38.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42a232e7487fc2ef313d96dde7948e7a3c05101870d8985e4fd8d26aedd27b89"
+dependencies = [
+ "memchr",
+ "serde",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.39.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2e3bf4aa9d243beeb01a7b3bc30b77cfe2c44e24ec02d751a7104a53c2c49a1"
 dependencies = [
  "memchr",
  "serde",
