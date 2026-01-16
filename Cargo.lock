@@ -262,15 +262,16 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-cloudfront"
-version = "1.105.0"
+version = "1.108.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "274d73c589ac39d97a42e553a5b9b8a79cd51b04e1078e7499f81f4bd9e85d74"
+checksum = "2bfe6f918ec55ca057f45d4a39d974122e227c51a6d7b446819b0042efcc252f"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
  "aws-smithy-async",
  "aws-smithy-http",
  "aws-smithy-json",
+ "aws-smithy-observability",
  "aws-smithy-runtime",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
@@ -3996,7 +3997,7 @@ dependencies = [
  "getrandom 0.3.3",
  "once_cell",
  "rustix",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
