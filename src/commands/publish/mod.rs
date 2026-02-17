@@ -87,6 +87,10 @@ pub struct Options {
     /// Used to filter which tags are considered for GitHub release lookup
     #[arg(long, env, default_value = "v*")]
     tag_pattern: String,
+    /// Skip crate-exists check, allowing republish of already-published versions.
+    /// Only use with registries that support overwrites (e.g., kellnr).
+    #[arg(long, env, default_value = "false")]
+    force_publish: bool,
 }
 
 #[derive(Serialize, Default, Clone)]
@@ -445,6 +449,7 @@ async fn publish_package(
     common_options: Arc<PackageRelatedOptions>,
     options: Arc<Options>,
     registries: HashSet<String>,
+    member_paths: Arc<Vec<PathBuf>>,
 ) {
     if let Some(ref package_id) = package.package_id {
         loop {
@@ -490,15 +495,16 @@ async fn publish_package(
         // Acquire a permit from the semaphore to limit the number of concurrent tasks
         let permit = semaphore.acquire().await;
         debug!("Doing package: {}", package.package);
-        let success = do_publish_package(
-            repo_root.clone(),
-            package.clone(),
+        let success = do_publish_package(DoPublishParams {
+            repo_root: repo_root.clone(),
+            package: package.clone(),
             output_dir,
             cargo,
-            &common_options,
-            &options,
+            common_options: common_options.as_ref().clone(),
+            options: options.as_ref().clone(),
             registries,
-        )
+            member_paths,
+        })
         .await;
         debug!("Done package: {}", package.package);
         let mut map = statuses.write().expect("RwLock poisoned");
@@ -605,17 +611,30 @@ pub async fn create_cloudfront_invalidation(
     ))
 }
 
-/// Actual Publish
-async fn do_publish_package(
+struct DoPublishParams {
     repo_root: PathBuf,
     package: Package,
     output_dir: PathBuf,
     cargo: Arc<Cargo>,
-    common_options: &PackageRelatedOptions,
-    options: &Options,
+    common_options: PackageRelatedOptions,
+    options: Options,
     registries: HashSet<String>,
-) -> PublishResult {
-    let mut result = PublishResult::new(&package, registries, options);
+    member_paths: Arc<Vec<PathBuf>>,
+}
+
+/// Actual Publish
+async fn do_publish_package(params: DoPublishParams) -> PublishResult {
+    let DoPublishParams {
+        repo_root,
+        package,
+        output_dir,
+        cargo,
+        common_options,
+        options,
+        registries,
+        member_paths,
+    } = params;
+    let mut result = PublishResult::new(&package, registries.clone(), &options);
     result.start_time = Some(SystemTime::now());
     if !package.publish {
         result.end_time = Some(SystemTime::now());
@@ -770,8 +789,8 @@ async fn do_publish_package(
                         }
                     }
                     Err(e) => {
-                        result.nix_binary.success = false;
-                        result.nix_binary.stderr = format!("{}\n{}", result.s3.stderr, e);
+                        result.s3.success = false;
+                        result.s3.stderr = format!("{}\n{}", result.s3.stderr, e);
                         is_failed = true;
                     }
                 }
@@ -899,8 +918,23 @@ async fn do_publish_package(
                 if is_failed {
                     run = false;
                 }
+                if let Some(ref target) = common_options.cargo_target_registry
+                    && &registry_name != target
+                {
+                    run = false;
+                    r.should_publish = false;
+                }
                 if run && let Some(target_registry) = cargo.get_registry(&registry_name) {
                     if target_registry.index.is_none() {
+                        tracing::warn!(
+                            "Skipping cargo publish for {} to registry {}: no index configured",
+                            package_name,
+                            registry_name
+                        );
+                        r.success = false;
+                        r.stderr = format!("Registry {} has no index configured", registry_name);
+                        r.end_time = Some(SystemTime::now());
+                        result.cargo.insert(registry_name.clone(), r);
                         continue;
                     }
                     // For each reg we need to
@@ -908,11 +942,32 @@ async fn do_publish_package(
                     // 2. Find and replace `main_registry` to `current_registry` in Cargo.toml
                     // 3. Ensure there are Cargo.lock
                     // 4. Publish with --allow-dirty
+
+                    // Save workspace Cargo.lock before patching — cargo publish may modify it.
+                    // Walk up from package_path to find the workspace root Cargo.lock.
+                    let workspace_lock_path = {
+                        let mut dir = package_path.clone();
+                        loop {
+                            let candidate = dir.join("Cargo.lock");
+                            if candidate.exists() {
+                                break Some(candidate);
+                            }
+                            if !dir.pop() || dir < repo_root {
+                                break None;
+                            }
+                        }
+                    };
+                    let saved_lock_content = workspace_lock_path
+                        .as_ref()
+                        .and_then(|p| std::fs::read_to_string(p).ok());
+
                     if patch_crate_for_registry(
                         &repo_root,
                         &package_path,
                         original_registry,
                         target_registry,
+                        cargo.http_client(),
+                        &member_paths,
                     )
                     .is_ok()
                     {
@@ -939,17 +994,15 @@ async fn do_publish_package(
                         if options.dry_run {
                             args.push("--dry-run".to_string())
                         }
-                        let command_output = Script::new(
-                            format!("printenv | grep CARGO && cargo publish {}", args.join(" ")),
-                            true,
-                        )
-                        .current_dir(&package_path)
-                        .env_removals(&blacklist_envs)
-                        .envs(&envs)
-                        .log_stdout(tracing::Level::INFO)
-                        .log_stderr(tracing::Level::INFO)
-                        .execute()
-                        .await;
+                        let command_output =
+                            Script::new(format!("cargo publish {}", args.join(" ")), true)
+                                .current_dir(&package_path)
+                                .env_removals(&blacklist_envs)
+                                .envs(&envs)
+                                .log_stdout(tracing::Level::INFO)
+                                .log_stderr(tracing::Level::INFO)
+                                .execute()
+                                .await;
                         r.update_from_command(command_output);
                     } else {
                         r.success = false;
@@ -957,12 +1010,22 @@ async fn do_publish_package(
                             "registry {registry_name} not setup correctly, missing index, private_key, and token"
                         );
                     }
+
+                    // Restore workspace Cargo.lock before patch-back to avoid lock file corruption
+                    if let (Some(lock_path), Some(content)) =
+                        (&workspace_lock_path, &saved_lock_content)
+                    {
+                        let _ = std::fs::write(lock_path, content);
+                    }
+
                     // Path back to the main registry
                     if patch_crate_for_registry(
                         &repo_root,
                         &package_path,
                         target_registry,
                         original_registry,
+                        cargo.http_client(),
+                        &member_paths,
                     )
                     .is_err()
                     {
@@ -1361,7 +1424,8 @@ pub async fn publish(
     let check_workspace_options = CheckWorkspaceOptions::new()
         .with_check_publish(true)
         .with_autopublish_cargo(options.autopublish_cargo)
-        .with_ignore_dev_dependencies(true);
+        .with_ignore_dev_dependencies(true)
+        .with_force_publish(options.force_publish);
 
     let results =
         check_workspace::<Cargo>(common_options, &check_workspace_options, repo_root.clone())
@@ -1397,6 +1461,8 @@ pub async fn publish(
             registries.insert(registry_name.clone());
         }
     }
+    let member_paths: Vec<PathBuf> = results.members.values().map(|m| m.path.clone()).collect();
+    let member_paths = Arc::new(member_paths);
     // Filters members based on regex
     // Spawn a task for each object
     for (member_id, member) in &results.members {
@@ -1427,6 +1493,7 @@ pub async fn publish(
             Arc::new(common_options.clone()),
             Arc::new(options.clone()),
             registries.clone(),
+            member_paths.clone(),
         ));
         handles.push(task_handle);
     }

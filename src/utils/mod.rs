@@ -214,6 +214,10 @@ pub fn get_registry_env(registry_name: String) -> HashMap<String, String> {
     if let Ok(token) = get_env_or_log(format!("{registry_prefix}_TOKEN")) {
         envs.insert(format!("{registry_prefix}_TOKEN"), token.clone());
         envs.insert("Authorization".to_string(), token.clone());
+        envs.insert(
+            format!("{registry_prefix}_CREDENTIAL_PROVIDER"),
+            "cargo:token".to_string(),
+        );
     }
     if let Ok(user_agent) = get_env_or_log(format!("{registry_prefix}_USER_AGENT")) {
         envs.insert("CARGO_HTTP_USER_AGENT".to_string(), user_agent.clone());

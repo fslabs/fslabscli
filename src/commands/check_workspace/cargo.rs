@@ -27,6 +27,7 @@ impl PackageMetadataFslabsCiPublishCargo {
         version: String,
         cargo: &C,
         force: bool,
+        force_publish: bool,
     ) -> anyhow::Result<()> {
         tracing::debug!("Got following registries: {:?}", self.registries);
         self.publish = self.actual_publish.unwrap_or(force);
@@ -48,14 +49,24 @@ impl PackageMetadataFslabsCiPublishCargo {
                 registry_name
             );
 
-            let publish = match cargo
-                .check_crate_exists(registry_name.clone(), name.clone(), version.clone())
-                .await
-            {
-                Ok(crate_exists) => !crate_exists,
-                Err(e) => {
-                    tracing::error!("Could not check if crates already exists: {}", e);
-                    false
+            let publish = if force_publish {
+                tracing::warn!(
+                    "CARGO: force_publish enabled - bypassing existence check for {} v{} on registry {}",
+                    name,
+                    version,
+                    registry_name
+                );
+                true
+            } else {
+                match cargo
+                    .check_crate_exists(registry_name.clone(), name.clone(), version.clone())
+                    .await
+                {
+                    Ok(crate_exists) => !crate_exists,
+                    Err(e) => {
+                        tracing::error!("Could not check if crates already exists: {}", e);
+                        false
+                    }
                 }
             };
             self.registries_publish
@@ -64,6 +75,15 @@ impl PackageMetadataFslabsCiPublishCargo {
         }
         self.publish = overall_publish;
         Ok(())
+    }
+
+    pub fn filter_target_registry(&mut self, target_registry: &str) {
+        for (name, publish) in self.registries_publish.iter_mut() {
+            if name != target_registry {
+                *publish = false;
+            }
+        }
+        self.publish = self.registries_publish.values().any(|&v| v);
     }
 }
 
@@ -86,7 +106,13 @@ pub(crate) mod tests {
 
         let mut cargo_publish: PackageMetadataFslabsCiPublishCargo = toml::from_str(toml).unwrap();
         cargo_publish
-            .check("test".to_string(), "1.0.0".to_string(), &cargo, false)
+            .check(
+                "test".to_string(),
+                "1.0.0".to_string(),
+                &cargo,
+                false,
+                false,
+            )
             .await
             .unwrap();
 
@@ -107,7 +133,13 @@ pub(crate) mod tests {
 
         let mut cargo_publish: PackageMetadataFslabsCiPublishCargo = toml::from_str(toml).unwrap();
         cargo_publish
-            .check("test".to_string(), "1.0.0".to_string(), &cargo, false)
+            .check(
+                "test".to_string(),
+                "1.0.0".to_string(),
+                &cargo,
+                false,
+                false,
+            )
             .await
             .unwrap();
 
@@ -127,7 +159,13 @@ pub(crate) mod tests {
 
         let mut cargo_publish: PackageMetadataFslabsCiPublishCargo = toml::from_str(toml).unwrap();
         cargo_publish
-            .check("test".to_string(), "1.0.0".to_string(), &cargo, false)
+            .check(
+                "test".to_string(),
+                "1.0.0".to_string(),
+                &cargo,
+                false,
+                false,
+            )
             .await
             .unwrap();
 
@@ -147,7 +185,7 @@ pub(crate) mod tests {
 
         let mut cargo_publish: PackageMetadataFslabsCiPublishCargo = toml::from_str(toml).unwrap();
         cargo_publish
-            .check("test".to_string(), "1.0.0".to_string(), &cargo, true)
+            .check("test".to_string(), "1.0.0".to_string(), &cargo, true, false)
             .await
             .unwrap();
 
@@ -169,7 +207,7 @@ pub(crate) mod tests {
 
         let mut cargo_publish: PackageMetadataFslabsCiPublishCargo = toml::from_str(toml).unwrap();
         cargo_publish
-            .check("test".to_string(), "1.0.0".to_string(), &cargo, true)
+            .check("test".to_string(), "1.0.0".to_string(), &cargo, true, false)
             .await
             .unwrap();
 
@@ -188,7 +226,13 @@ pub(crate) mod tests {
 
         let mut cargo_publish: PackageMetadataFslabsCiPublishCargo = toml::from_str(toml).unwrap();
         cargo_publish
-            .check("test".to_string(), "1.0.0".to_string(), &cargo, false)
+            .check(
+                "test".to_string(),
+                "1.0.0".to_string(),
+                &cargo,
+                false,
+                false,
+            )
             .await
             .unwrap();
 
@@ -209,10 +253,89 @@ pub(crate) mod tests {
 
         let mut cargo_publish: PackageMetadataFslabsCiPublishCargo = toml::from_str(toml).unwrap();
         cargo_publish
-            .check("test".to_string(), "1.0.0".to_string(), &cargo, true)
+            .check("test".to_string(), "1.0.0".to_string(), &cargo, true, false)
             .await
             .unwrap();
 
+        assert!(!cargo_publish.publish);
+    }
+
+    #[tokio::test]
+    async fn test_force_publish_bypasses_crate_exists_check() {
+        let toml = r#"
+        publish = true
+        alternate_registries = ["test_registry"]
+        "#;
+        let cargo = MockCargo::new();
+
+        // No expect_check_crate_exists: it should NOT be called when force_publish=true
+
+        let mut cargo_publish: PackageMetadataFslabsCiPublishCargo = toml::from_str(toml).unwrap();
+        cargo_publish
+            .check("test".to_string(), "1.0.0".to_string(), &cargo, false, true)
+            .await
+            .unwrap();
+
+        assert!(cargo_publish.publish);
+        assert!(cargo_publish.registries_publish["test_registry"]);
+    }
+
+    #[test]
+    fn test_filter_target_registry_keeps_only_target() {
+        // Arrange
+        let mut cargo_publish = PackageMetadataFslabsCiPublishCargo {
+            publish: true,
+            registries_publish: HashMap::from([
+                ("registry_a".to_string(), true),
+                ("registry_b".to_string(), true),
+            ]),
+            ..Default::default()
+        };
+
+        // Act
+        cargo_publish.filter_target_registry("registry_a");
+
+        // Assert
+        assert!(cargo_publish.registries_publish["registry_a"]);
+        assert!(!cargo_publish.registries_publish["registry_b"]);
+        assert!(cargo_publish.publish);
+    }
+
+    #[test]
+    fn test_filter_target_registry_no_match_disables_publish() {
+        // Arrange
+        let mut cargo_publish = PackageMetadataFslabsCiPublishCargo {
+            publish: true,
+            registries_publish: HashMap::from([("registry_a".to_string(), true)]),
+            ..Default::default()
+        };
+
+        // Act
+        cargo_publish.filter_target_registry("nonexistent");
+
+        // Assert
+        assert!(!cargo_publish.registries_publish["registry_a"]);
+        assert!(!cargo_publish.publish);
+    }
+
+    #[test]
+    fn test_filter_target_registry_preserves_already_false() {
+        // Arrange
+        let mut cargo_publish = PackageMetadataFslabsCiPublishCargo {
+            publish: true,
+            registries_publish: HashMap::from([
+                ("registry_a".to_string(), false),
+                ("registry_b".to_string(), true),
+            ]),
+            ..Default::default()
+        };
+
+        // Act
+        cargo_publish.filter_target_registry("registry_a");
+
+        // Assert
+        assert!(!cargo_publish.registries_publish["registry_a"]);
+        assert!(!cargo_publish.registries_publish["registry_b"]);
         assert!(!cargo_publish.publish);
     }
 }

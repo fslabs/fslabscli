@@ -21,6 +21,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use temp_dir::TempDir;
+use tokio::runtime::Handle;
 use toml_edit::{DocumentMut, Table, table, value};
 use walkdir::WalkDir;
 
@@ -36,6 +37,12 @@ pub struct CargoRegistry {
 }
 
 impl CargoRegistry {
+    pub fn is_sparse(&self) -> bool {
+        self.index
+            .as_ref()
+            .is_some_and(|idx| idx.starts_with("sparse+"))
+    }
+
     /// Merge another CargoRegistry into this one.
     fn merge(&mut self, other: &CargoRegistry) {
         if self.index.is_none()
@@ -163,6 +170,11 @@ impl CargoRegistry {
             .index
             .clone()
             .context("Cannot fetch inexistent index")?;
+
+        if self.is_sparse() {
+            return Ok(());
+        }
+
         let tmp = TempDir::new()?.dont_delete_on_drop();
         let path = tmp.path();
 
@@ -186,56 +198,146 @@ impl CargoRegistry {
         Ok(())
     }
 
-    fn get_crate_checksum(&self, package_name: &str, version: &str) -> anyhow::Result<String> {
-        let Some(local_index_path) = self.local_index_path.clone() else {
-            anyhow::bail!("Cannot get checksum of unfetched registry");
-        };
+    fn get_crate_checksum(
+        &self,
+        package_name: &str,
+        version: &str,
+        http_client: Option<&HyperClient<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
+    ) -> anyhow::Result<String> {
+        if self.is_sparse() {
+            let index = self
+                .index
+                .as_ref()
+                .context("Cannot get checksum without index")?;
+            let base_url = index
+                .strip_prefix("sparse+")
+                .context("Invalid sparse index URL")?;
 
-        let package_dir = get_package_file_dir(package_name)?;
-        let package_file_path = local_index_path.join(package_dir).join(package_name);
+            // Catches URL construction footgun that leads to strange errors.
+            let base_url = if base_url.ends_with('/') {
+                base_url
+            } else {
+                &format!("{}/", base_url)
+            };
 
-        let package_file = File::open(&package_file_path)?;
-        let reader = BufReader::new(package_file);
+            let package_dir = get_package_file_dir(package_name)?;
+            let url: Uri = format!("{}{}/{}", base_url, package_dir, package_name).parse()?;
 
-        for (line_num, line) in reader.lines().enumerate() {
-            let line = line.with_context(|| {
-                format!(
-                    "Failed to read line {} from {:?}",
-                    line_num + 1,
-                    package_file_path
-                )
+            let client = http_client.context("HTTP client required for sparse registry")?;
+
+            let mut req_builder = Request::builder().method(Method::GET).uri(url.clone());
+
+            if let Some(token) = &self.token {
+                req_builder = req_builder.header("Authorization", token);
+            }
+
+            if let Some(user_agent) = &self.user_agent {
+                req_builder = req_builder.header("User-Agent", user_agent);
+            }
+
+            let req = req_builder.body(Empty::default())?;
+
+            let body_str = tokio::task::block_in_place(|| {
+                Handle::current().block_on(async {
+                    let res = client.request(req).await.with_context(|| {
+                        format!("Could not fetch from sparse registry: {}", url)
+                    })?;
+
+                    if res.status().as_u16() >= 400 {
+                        anyhow::bail!(
+                            "Failed to fetch crate index for {}: HTTP {}",
+                            package_name,
+                            res.status()
+                        );
+                    }
+
+                    let body = res
+                        .into_body()
+                        .collect()
+                        .await
+                        .context("Could not get body from sparse registry")?
+                        .to_bytes();
+
+                    Ok::<String, anyhow::Error>(String::from_utf8_lossy(&body).to_string())
+                })
             })?;
 
-            let pkg_version: IndexPackageVersion =
-                serde_json::from_str(&line).with_context(|| {
+            for line in body_str.lines() {
+                let pkg_version: IndexPackageVersion = serde_json::from_str(line)
+                    .with_context(|| format!("Failed to parse JSON line for {}", package_name))?;
+
+                if pkg_version.version == version {
+                    if pkg_version.yanked {
+                        anyhow::bail!(
+                            "Version {} yanked for crate {} in registry {}",
+                            version,
+                            package_name,
+                            self.name
+                        );
+                    }
+                    return pkg_version.checksum.ok_or_else(|| {
+                        anyhow::anyhow!("No checksum for {}@{}", package_name, version)
+                    });
+                }
+            }
+
+            anyhow::bail!(
+                "Version {} not found for crate {} in registry {}",
+                version,
+                package_name,
+                self.name
+            )
+        } else {
+            let Some(local_index_path) = self.local_index_path.clone() else {
+                anyhow::bail!("Cannot get checksum of unfetched registry");
+            };
+
+            let package_dir = get_package_file_dir(package_name)?;
+            let package_file_path = local_index_path.join(package_dir).join(package_name);
+
+            let package_file = File::open(&package_file_path)?;
+            let reader = BufReader::new(package_file);
+
+            for (line_num, line) in reader.lines().enumerate() {
+                let line = line.with_context(|| {
                     format!(
-                        "Failed to parse JSON at line {} in {:?}",
+                        "Failed to read line {} from {:?}",
                         line_num + 1,
                         package_file_path
                     )
                 })?;
 
-            if pkg_version.version == version {
-                if pkg_version.yanked {
-                    anyhow::bail!(
-                        "Version {} yanked for crate {} in registry {}",
-                        version,
-                        package_name,
-                        self.name
-                    );
-                }
-                return pkg_version.checksum.ok_or_else(|| {
-                    anyhow::anyhow!("No checksum for {}@{}", package_name, version)
-                });
-            }
-        }
+                let pkg_version: IndexPackageVersion =
+                    serde_json::from_str(&line).with_context(|| {
+                        format!(
+                            "Failed to parse JSON at line {} in {:?}",
+                            line_num + 1,
+                            package_file_path
+                        )
+                    })?;
 
-        anyhow::bail!(
-            "Version {} not found for crate {} in registry {}",
-            version,
-            package_name,
-            self.name
-        )
+                if pkg_version.version == version {
+                    if pkg_version.yanked {
+                        anyhow::bail!(
+                            "Version {} yanked for crate {} in registry {}",
+                            version,
+                            package_name,
+                            self.name
+                        );
+                    }
+                    return pkg_version.checksum.ok_or_else(|| {
+                        anyhow::anyhow!("No checksum for {}@{}", package_name, version)
+                    });
+                }
+            }
+
+            anyhow::bail!(
+                "Version {} not found for crate {} in registry {}",
+                version,
+                package_name,
+                self.name
+            )
+        }
     }
 }
 
@@ -330,6 +432,10 @@ impl Cargo {
     pub fn add_registry(&mut self, registry: CargoRegistry) {
         self.registries.insert(registry.name.clone(), registry);
     }
+
+    pub fn http_client(&self) -> Option<&HyperClient<HttpsConnector<HttpConnector>, Empty<Bytes>>> {
+        self.client.as_ref()
+    }
 }
 
 pub fn get_package_file_dir(package_name: &str) -> anyhow::Result<String> {
@@ -366,6 +472,80 @@ impl CrateChecker for Cargo {
             .registries
             .get(&registry_name)
             .ok_or_else(|| anyhow::anyhow!("unknown registry"))?;
+
+        if registry.is_sparse() {
+            let index = registry
+                .index
+                .as_ref()
+                .context("Cannot check crate existence without index")?;
+            let base_url = index
+                .strip_prefix("sparse+")
+                .context("Invalid sparse index URL")?;
+
+            // Catches URL construction footgun that leads to strange errors.
+            let base_url = if base_url.ends_with('/') {
+                base_url
+            } else {
+                &format!("{}/", base_url)
+            };
+
+            let package_dir = get_package_file_dir(&name)?;
+            let url: Uri = format!("{}{}/{}", base_url, package_dir, name).parse()?;
+
+            let client = self
+                .client
+                .as_ref()
+                .context("HTTP client required for sparse registry")?;
+
+            let mut req_builder = Request::builder().method(Method::GET).uri(url.clone());
+
+            if let Some(token) = &registry.token {
+                req_builder = req_builder.header("Authorization", token);
+            }
+
+            if let Some(user_agent) = &registry.user_agent {
+                req_builder = req_builder.header("User-Agent", user_agent);
+            }
+
+            let req = req_builder.body(Empty::default())?;
+
+            let res = client
+                .request(req)
+                .await
+                .with_context(|| format!("Could not fetch from sparse registry: {}", url))?;
+
+            if res.status().as_u16() == 404 {
+                return Ok(false);
+            }
+
+            if res.status().as_u16() >= 400 {
+                anyhow::bail!(
+                    "Failed to fetch crate index for {}: HTTP {}",
+                    name,
+                    res.status()
+                );
+            }
+
+            let body = res
+                .into_body()
+                .collect()
+                .await
+                .context("Could not get body from sparse registry")?
+                .to_bytes();
+
+            let body_str = String::from_utf8_lossy(&body);
+
+            for line in body_str.lines() {
+                let pkg_version: IndexPackageVersion = serde_json::from_str(line)
+                    .with_context(|| format!("Failed to parse JSON line for {}", name))?;
+
+                if pkg_version.version == version && !pkg_version.yanked {
+                    return Ok(true);
+                }
+            }
+
+            return Ok(false);
+        }
 
         // We need an url
         if let Some(crate_url) = &registry.crate_url {
@@ -508,10 +688,27 @@ fn parse_quoted_value(line: &str) -> Option<String> {
     })
 }
 
+fn source_matches_index(source: &str, index: &str) -> bool {
+    if index.starts_with("sparse+") {
+        source == index
+    } else {
+        source.starts_with(&format!("registry+{}", index))
+    }
+}
+
+fn format_source_line(index: &str) -> String {
+    if index.starts_with("sparse+") {
+        index.to_string()
+    } else {
+        format!("registry+{}", index)
+    }
+}
+
 fn replace_registry_in_cargo_lock(
     path: &Path,
     original_registry: &CargoRegistry,
     target_registry: &CargoRegistry,
+    http_client: Option<&HyperClient<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
 ) -> anyhow::Result<()> {
     let original_index = original_registry
         .index
@@ -522,10 +719,10 @@ fn replace_registry_in_cargo_lock(
         .as_ref()
         .context(format!("Registry {} has no index", target_registry.name))?;
 
-    if original_registry.local_index_path.is_none() {
+    if !original_registry.is_sparse() && original_registry.local_index_path.is_none() {
         anyhow::bail!("Registry {} index not fetched", original_registry.name);
     }
-    if original_registry.local_index_path.is_none() {
+    if !target_registry.is_sparse() && target_registry.local_index_path.is_none() {
         anyhow::bail!("Registry {} index not fetched", target_registry.name);
     }
 
@@ -575,14 +772,15 @@ fn replace_registry_in_cargo_lock(
         // Parse and potentially update source
         if trimmed.starts_with("source = ") {
             if let Some(source) = parse_quoted_value(trimmed)
-                && source.starts_with(&format!("registry+{}", original_index))
+                && source_matches_index(&source, original_index)
             {
                 in_target_package = true;
 
                 let indent = &line[..line.len() - trimmed.len()];
                 output.push_str(&format!(
-                    "{}source = \"registry+{}\"\n",
-                    indent, target_index
+                    "{}source = \"{}\"\n",
+                    indent,
+                    format_source_line(target_index)
                 ));
                 continue;
             }
@@ -595,7 +793,7 @@ fn replace_registry_in_cargo_lock(
         // Update checksum if we're in a target package
         if in_target_package && trimmed.starts_with("checksum = ") {
             let Ok(updated_checksum) =
-                target_registry.get_crate_checksum(&current_name, &current_version)
+                target_registry.get_crate_checksum(&current_name, &current_version, http_client)
             else {
                 continue;
             };
@@ -613,11 +811,176 @@ fn replace_registry_in_cargo_lock(
     Ok(())
 }
 
+/// Selectively replace registry references in Cargo.lock only for workspace member packages.
+fn replace_registry_in_cargo_lock_selective(
+    path: &Path,
+    original_registry: &CargoRegistry,
+    target_registry: &CargoRegistry,
+    http_client: Option<&HyperClient<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
+    member_names: &std::collections::HashSet<String>,
+) -> anyhow::Result<()> {
+    let original_index = original_registry
+        .index
+        .as_ref()
+        .context(format!("Registry {} has no index", original_registry.name))?;
+    let target_index = target_registry
+        .index
+        .as_ref()
+        .context(format!("Registry {} has no index", target_registry.name))?;
+
+    if !original_registry.is_sparse() && original_registry.local_index_path.is_none() {
+        anyhow::bail!("Registry {} index not fetched", original_registry.name);
+    }
+    if !target_registry.is_sparse() && target_registry.local_index_path.is_none() {
+        anyhow::bail!("Registry {} index not fetched", target_registry.name);
+    }
+
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+
+    let mut output = String::new();
+    let mut in_target_package = false;
+    let mut current_name = String::new();
+    let mut current_version = String::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim_start();
+
+        // Detect start of new package
+        if trimmed.starts_with("[[package]]") {
+            in_target_package = false;
+            current_name.clear();
+            current_version.clear();
+            output.push_str(&line);
+            output.push('\n');
+            continue;
+        }
+
+        // Parse name
+        if trimmed.starts_with("name = ") {
+            if let Some(name) = parse_quoted_value(trimmed) {
+                current_name = name;
+            }
+            output.push_str(&line);
+            output.push('\n');
+            continue;
+        }
+
+        // Parse version
+        if trimmed.starts_with("version = ") {
+            if let Some(version) = parse_quoted_value(trimmed) {
+                current_version = version;
+            }
+            output.push_str(&line);
+            output.push('\n');
+            continue;
+        }
+
+        // Parse and potentially update source — only if package is a workspace member
+        if trimmed.starts_with("source = ") {
+            if let Some(source) = parse_quoted_value(trimmed)
+                && source_matches_index(&source, original_index)
+                && member_names.contains(&current_name)
+            {
+                in_target_package = true;
+
+                let indent = &line[..line.len() - trimmed.len()];
+                output.push_str(&format!(
+                    "{}source = \"{}\"\n",
+                    indent,
+                    format_source_line(target_index)
+                ));
+                continue;
+            }
+
+            output.push_str(&line);
+            output.push('\n');
+            continue;
+        }
+
+        // Update checksum if we're in a target package
+        if in_target_package && trimmed.starts_with("checksum = ") {
+            let Ok(updated_checksum) =
+                target_registry.get_crate_checksum(&current_name, &current_version, http_client)
+            else {
+                continue;
+            };
+
+            let indent = &line[..line.len() - trimmed.len()];
+            output.push_str(&format!("{}checksum = \"{}\"\n", indent, updated_checksum));
+            continue;
+        }
+
+        output.push_str(&line);
+        output.push('\n');
+    }
+
+    fs::write(path, output)?;
+    Ok(())
+}
+
+/// Reads `[package].name` from each member's Cargo.toml to build a set of workspace member names.
+fn collect_member_package_names(
+    member_paths: &[PathBuf],
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let mut names = std::collections::HashSet::new();
+    for dir in member_paths {
+        let cargo_toml = dir.join("Cargo.toml");
+        if cargo_toml.exists() {
+            let content = fs::read_to_string(&cargo_toml)?;
+            let doc: DocumentMut = content
+                .parse()
+                .with_context(|| format!("Failed to parse {}", cargo_toml.display()))?;
+            if let Some(pkg) = doc.get("package").and_then(|p| p.as_table())
+                && let Some(name) = pkg.get("name").and_then(|n| n.as_str())
+            {
+                names.insert(name.to_string());
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// Selectively patches registry refs in [workspace.dependencies] only for the given package names.
+fn replace_registry_in_workspace_deps(
+    path: &Path,
+    original_registry: &CargoRegistry,
+    target_registry: &CargoRegistry,
+    member_names: &std::collections::HashSet<String>,
+) -> anyhow::Result<()> {
+    let content = fs::read_to_string(path)?;
+    let mut doc: DocumentMut = content
+        .parse()
+        .with_context(|| format!("Failed to parse {}", path.display()))?;
+
+    if let Some(ws) = doc.get_mut("workspace").and_then(|w| w.as_table_mut())
+        && let Some(deps) = ws.get_mut("dependencies").and_then(|d| d.as_table_mut())
+    {
+        for (key, item) in deps.iter_mut() {
+            if !member_names.contains(key.get()) {
+                continue;
+            }
+            if let Some(tbl) = item.as_table_like_mut()
+                && let Some(reg) = tbl.get("registry").and_then(|r| r.as_str())
+                && reg == original_registry.name
+            {
+                tbl.insert("registry", toml_edit::value(&target_registry.name));
+            }
+        }
+    }
+
+    fs::write(path, doc.to_string())?;
+    Ok(())
+}
+
 pub fn patch_crate_for_registry(
     root_directory: &Path,
     working_directory: &Path,
     original_registry: &CargoRegistry,
     target_registry: &CargoRegistry,
+    http_client: Option<&HyperClient<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
+    member_paths: &[PathBuf],
 ) -> anyhow::Result<()> {
     let cargo_toml_path = working_directory.join("Cargo.toml");
     // Read the Cargo.toml file
@@ -636,15 +999,81 @@ pub fn patch_crate_for_registry(
     fs::write(&cargo_toml_path, doc.to_string())?;
 
     // 2. Find and replace all the registry value with the provided `registry_name`
-    for entry in WalkDir::new(root_directory).into_iter() {
-        let entry = entry?;
-        if entry.path().ends_with("Cargo.toml") {
-            // Perform replacement for each Cargo.toml file found
-            replace_registry_in_cargo_toml(entry.path(), original_registry, target_registry)?;
+    // Scope patching to workspace member dirs only. Empty slice = fallback to root (backward compat).
+    let dirs_to_scan: Vec<PathBuf> = if member_paths.is_empty() {
+        vec![root_directory.to_path_buf()]
+    } else {
+        member_paths.to_vec()
+    };
+
+    let mut patched_files = std::collections::HashSet::new();
+
+    for dir in &dirs_to_scan {
+        for entry in WalkDir::new(dir).into_iter() {
+            let entry = entry?;
+            let path = entry.path().to_path_buf();
+            if path.ends_with("Cargo.toml") {
+                // Skip root Cargo.toml in member-paths mode — handled below with selective patching
+                if !member_paths.is_empty() && path == root_directory.join("Cargo.toml") {
+                    continue;
+                }
+                if patched_files.insert(path.clone()) {
+                    replace_registry_in_cargo_toml(&path, original_registry, target_registry)?;
+                }
+            }
+            if path.ends_with("Cargo.lock") {
+                // Skip root Cargo.lock in member-paths mode — handled below with selective patching
+                if !member_paths.is_empty() && path == root_directory.join("Cargo.lock") {
+                    continue;
+                }
+                if patched_files.insert(path.clone()) {
+                    replace_registry_in_cargo_lock(
+                        &path,
+                        original_registry,
+                        target_registry,
+                        http_client,
+                    )?;
+                }
+            }
         }
-        if entry.path().ends_with("Cargo.lock") {
-            // Perform replacement for each Cargo.lock file found
-            replace_registry_in_cargo_lock(entry.path(), original_registry, target_registry)?;
+    }
+
+    // Compute member names once for both root Cargo.toml and Cargo.lock selective patching
+    let member_names = if !member_paths.is_empty() {
+        collect_member_package_names(member_paths)?
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    // Selectively patch workspace-root Cargo.toml — only member deps, not external ones
+    let root_toml = root_directory.join("Cargo.toml");
+    if root_toml.exists() && patched_files.insert(root_toml.clone()) && !member_names.is_empty() {
+        replace_registry_in_workspace_deps(
+            &root_toml,
+            original_registry,
+            target_registry,
+            &member_names,
+        )?;
+    }
+
+    // Selectively patch workspace-root Cargo.lock — only member packages, not external deps
+    let root_lock = root_directory.join("Cargo.lock");
+    if root_lock.exists() && patched_files.insert(root_lock.clone()) {
+        if !member_names.is_empty() {
+            replace_registry_in_cargo_lock_selective(
+                &root_lock,
+                original_registry,
+                target_registry,
+                http_client,
+                &member_names,
+            )?;
+        } else {
+            replace_registry_in_cargo_lock(
+                &root_lock,
+                original_registry,
+                target_registry,
+                http_client,
+            )?;
         }
     }
 
@@ -716,7 +1145,7 @@ publish = ["main_registry"]"#;
 
         // Run the patch_crate_for_registry function with a registry name and main_registry
         assert!(
-            patch_crate_for_registry(&tmp, &tmp, &original_registry, &target_registry)
+            patch_crate_for_registry(&tmp, &tmp, &original_registry, &target_registry, None, &[])
                 .map_err(|e| {
                     println!("Error: {e:#?}");
                     e
@@ -768,7 +1197,10 @@ dependencies = { some_crate = { registry = "main_registry" } }"#;
         fs::write(&cargo_toml_path, toml_content).unwrap();
 
         // Run the patch_crate_for_registry function with a registry name and main_registry
-        assert!(patch_crate_for_registry(&tmp, &tmp, &original_registry, &target_registry).is_ok(),);
+        assert!(
+            patch_crate_for_registry(&tmp, &tmp, &original_registry, &target_registry, None, &[])
+                .is_ok(),
+        );
 
         // Read the updated Cargo.toml and check if `main_registry` was replaced
         let updated_toml = fs::read_to_string(cargo_toml_path).unwrap();
@@ -812,7 +1244,10 @@ version = "0.1.0""#;
         fs::write(&cargo_toml_path, toml_content).unwrap();
 
         // Run the patch_crate_for_registry function with a registry name and main_registry
-        assert!(patch_crate_for_registry(&tmp, &tmp, &original_registry, &target_registry).is_ok());
+        assert!(
+            patch_crate_for_registry(&tmp, &tmp, &original_registry, &target_registry, None, &[])
+                .is_ok()
+        );
 
         // Read the updated Cargo.toml and check if `publish` was correctly updated
         let updated_toml = fs::read_to_string(cargo_toml_path).unwrap();
@@ -891,7 +1326,10 @@ dependencies = [
         fs::write(&cargo_lock_path, &lock_content).unwrap();
 
         // Run the patch_crate_for_registry function and check for success
-        assert!(patch_crate_for_registry(&tmp, &tmp, &original_registry, &target_registry).is_ok());
+        assert!(
+            patch_crate_for_registry(&tmp, &tmp, &original_registry, &target_registry, None, &[])
+                .is_ok()
+        );
         let wanted_replaced_toml_content = r#"[package]
 name = "my-package"
 version = "0.1.0"
@@ -1025,7 +1463,7 @@ dependencies = [
         )
         .unwrap();
 
-        let checksum = reg.get_crate_checksum("crate-test", "0.2.2");
+        let checksum = reg.get_crate_checksum("crate-test", "0.2.2", None);
         let error = checksum.unwrap_err();
         assert_eq!(
             format!("{}", error),
@@ -1048,7 +1486,7 @@ dependencies = [
         )
         .unwrap();
 
-        let checksum = reg.get_crate_checksum("crate-test", "0.2.2").unwrap();
+        let checksum = reg.get_crate_checksum("crate-test", "0.2.2", None).unwrap();
         assert_eq!(
             checksum,
             "b274d286f7a6aad5a7d5b5407e9db0098c94911fb3563bf2e32854a611edfb63".to_string()
@@ -1071,7 +1509,9 @@ dependencies = [
         )
         .unwrap();
 
-        let checksum = reg.get_crate_checksum("test-crate-3", "0.1.1").unwrap();
+        let checksum = reg
+            .get_crate_checksum("test-crate-3", "0.1.1", None)
+            .unwrap();
         assert_eq!(
             checksum,
             "b2e46d3c153c6cf8fa31efcfa96d6256e650321d087da1537faf21528b894f67".to_string()
@@ -1093,7 +1533,7 @@ dependencies = [
         )
         .unwrap();
 
-        let checksum = reg.get_crate_checksum("crate-test-bis", "0.2.2");
+        let checksum = reg.get_crate_checksum("crate-test-bis", "0.2.2", None);
 
         let error = checksum.unwrap_err();
         assert_eq!(
@@ -1117,7 +1557,7 @@ dependencies = [
         )
         .unwrap();
 
-        let checksum = reg.get_crate_checksum("crate-test", "0.8.0");
+        let checksum = reg.get_crate_checksum("crate-test", "0.8.0", None);
 
         let error = checksum.unwrap_err();
         assert_eq!(
@@ -1141,7 +1581,7 @@ dependencies = [
         )
         .unwrap();
 
-        let checksum = reg.get_crate_checksum("crate-test", "0.2.3");
+        let checksum = reg.get_crate_checksum("crate-test", "0.2.3", None);
 
         let error = checksum.unwrap_err();
         assert_eq!(
@@ -1180,5 +1620,362 @@ dependencies = [
     #[test]
     fn test_get_package_file_dir_long_package_name() {
         assert_eq!(get_package_file_dir("tensorflow").unwrap(), "te/ns");
+    }
+
+    #[test]
+    fn test_is_sparse_with_sparse_index() {
+        let registry = CargoRegistry {
+            name: "test-registry".to_string(),
+            index: Some("sparse+https://registry.example.com/index/".to_string()),
+            ..Default::default()
+        };
+
+        assert!(registry.is_sparse());
+    }
+
+    #[test]
+    fn test_is_sparse_with_git_index() {
+        let registry = CargoRegistry {
+            name: "test-registry".to_string(),
+            index: Some("https://github.com/org/index.git".to_string()),
+            ..Default::default()
+        };
+
+        assert!(!registry.is_sparse());
+    }
+
+    #[test]
+    fn test_is_sparse_with_no_index() {
+        let registry = CargoRegistry {
+            name: "test-registry".to_string(),
+            index: None,
+            ..Default::default()
+        };
+
+        assert!(!registry.is_sparse());
+    }
+
+    #[test]
+    fn test_source_matches_git_index() {
+        assert!(source_matches_index(
+            "registry+https://github.com/org/index.git",
+            "https://github.com/org/index.git"
+        ));
+    }
+
+    #[test]
+    fn test_source_matches_sparse_index() {
+        assert!(source_matches_index(
+            "sparse+https://registry.example.com/index/",
+            "sparse+https://registry.example.com/index/"
+        ));
+    }
+
+    #[test]
+    fn test_source_does_not_match_wrong_index() {
+        assert!(!source_matches_index(
+            "registry+https://other.com/index",
+            "https://github.com/org/index.git"
+        ));
+    }
+
+    #[test]
+    fn test_format_source_line_git() {
+        assert_eq!(
+            format_source_line("https://github.com/org/index.git"),
+            "registry+https://github.com/org/index.git"
+        );
+    }
+
+    #[test]
+    fn test_format_source_line_sparse() {
+        assert_eq!(
+            format_source_line("sparse+https://registry.example.com/index/"),
+            "sparse+https://registry.example.com/index/"
+        );
+    }
+
+    #[test]
+    fn test_fetch_index_noop_for_sparse() {
+        let mut registry = CargoRegistry {
+            name: "test-registry".to_string(),
+            index: Some("sparse+https://registry.example.com/index/".to_string()),
+            ..Default::default()
+        };
+
+        let result = registry.fetch_index();
+
+        assert!(result.is_ok());
+        assert!(registry.local_index_path.is_none());
+    }
+
+    #[test]
+    fn test_patching_cargo_lock_sparse_source() {
+        let target_checksum = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+        let target_index = create_rust_index(target_checksum);
+
+        let original_registry = CargoRegistry {
+            name: "old_registry".to_string(),
+            index: Some("sparse+https://old-registry.example.com/index/".to_string()),
+            ..Default::default()
+        };
+        let target_registry = CargoRegistry::new(
+            "new_registry".to_string(),
+            Some(target_index.to_string_lossy().to_string()),
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+
+        let tmp = assert_fs::TempDir::new()
+            .unwrap()
+            .into_persistent()
+            .to_path_buf();
+
+        let cargo_toml_path = tmp.join("Cargo.toml");
+        let cargo_lock_path = tmp.join("Cargo.lock");
+
+        let toml_content = r#"[package]
+name = "my-package"
+version = "0.1.0"
+publish = ["old_registry"]
+
+[dependencies]
+crate-test = { version = "0.2.2", registry = "old_registry" }"#;
+        let lock_content = r#"# This file is automatically @generated by Cargo.
+# It is not intended for manual editing.
+version = 4
+
+[[package]]
+name = "crate-test"
+version = "0.2.2"
+source = "sparse+https://old-registry.example.com/index/"
+checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+dependencies = []
+
+[[package]]
+name = "my-package"
+version = "0.1.0"
+dependencies = [
+ "dep",
+]
+"#;
+
+        fs::write(&cargo_toml_path, toml_content).unwrap();
+        fs::write(&cargo_lock_path, lock_content).unwrap();
+
+        assert!(
+            patch_crate_for_registry(&tmp, &tmp, &original_registry, &target_registry, None, &[])
+                .is_ok()
+        );
+
+        let replaced_lock_content = fs::read_to_string(cargo_lock_path).unwrap();
+        assert!(replaced_lock_content.contains(&format!("registry+{}", target_index.display())));
+        assert!(replaced_lock_content.contains(target_checksum));
+        assert!(!replaced_lock_content.contains("sparse+https://old-registry.example.com/index/"));
+        assert!(
+            !replaced_lock_content
+                .contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+    }
+
+    #[test]
+    fn test_patch_scopes_to_member_paths() {
+        let tmp = assert_fs::TempDir::new()
+            .unwrap()
+            .into_persistent()
+            .to_path_buf();
+
+        let original_registry = CargoRegistry {
+            name: "main_registry".to_string(),
+            index: Some("https://main.example.com".to_string()),
+            ..Default::default()
+        };
+        let target_registry = CargoRegistry {
+            name: "target_registry".to_string(),
+            index: Some("https://target.example.com".to_string()),
+            ..Default::default()
+        };
+
+        // Root Cargo.toml (working_directory target)
+        let root_toml = tmp.join("Cargo.toml");
+        fs::write(
+            &root_toml,
+            r#"[package]
+name = "root"
+version = "0.1.0"
+"#,
+        )
+        .unwrap();
+
+        // Member directory
+        let member_dir = tmp.join("crates").join("member1");
+        fs::create_dir_all(&member_dir).unwrap();
+        let member_toml = member_dir.join("Cargo.toml");
+        fs::write(
+            &member_toml,
+            r#"[package]
+name = "member1"
+version = "0.1.0"
+
+[dependencies]
+some_dep = { version = "1.0", registry = "main_registry" }
+"#,
+        )
+        .unwrap();
+
+        // Vendor directory (should NOT be patched)
+        let vendor_dir = tmp.join("vendor").join("baseline");
+        fs::create_dir_all(&vendor_dir).unwrap();
+        let vendor_toml = vendor_dir.join("Cargo.toml");
+        fs::write(
+            &vendor_toml,
+            r#"[package]
+name = "vendored_crate"
+version = "0.1.0"
+
+[dependencies]
+old_dep = { version = "0.5", registry = "main_registry" }
+"#,
+        )
+        .unwrap();
+
+        let member_paths = vec![member_dir.clone()];
+
+        // Patch scoped to member_paths only
+        patch_crate_for_registry(
+            &tmp,
+            root_toml.parent().unwrap(),
+            &original_registry,
+            &target_registry,
+            None,
+            &member_paths,
+        )
+        .unwrap();
+
+        // Member should be patched
+        let member_content = fs::read_to_string(&member_toml).unwrap();
+        assert!(
+            member_content.contains("target_registry"),
+            "Member Cargo.toml should have target_registry, got:\n{member_content}"
+        );
+        assert!(
+            !member_content.contains("main_registry"),
+            "Member Cargo.toml should not contain main_registry, got:\n{member_content}"
+        );
+
+        // Vendor should NOT be patched
+        let vendor_content = fs::read_to_string(&vendor_toml).unwrap();
+        assert!(
+            vendor_content.contains("main_registry"),
+            "Vendor Cargo.toml should still have main_registry, got:\n{vendor_content}"
+        );
+        assert!(
+            !vendor_content.contains("target_registry"),
+            "Vendor Cargo.toml should not have target_registry, got:\n{vendor_content}"
+        );
+    }
+
+    #[test]
+    fn test_selective_workspace_deps_patching() {
+        let tmp = assert_fs::TempDir::new()
+            .unwrap()
+            .into_persistent()
+            .to_path_buf();
+
+        let original_registry = CargoRegistry::new(
+            "main_registry".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let target_registry = CargoRegistry::new(
+            "my_registry".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // Create member_a directory
+        let member_a_dir = tmp.join("member_a");
+        fs::create_dir_all(&member_a_dir).unwrap();
+
+        // Create member_a Cargo.toml
+        let member_a_toml = member_a_dir.join("Cargo.toml");
+        fs::write(
+            &member_a_toml,
+            r#"[package]
+name = "member_a"
+version = "0.1.0"
+
+[dependencies]
+some_dep = { version = "1.0", registry = "main_registry" }
+"#,
+        )
+        .unwrap();
+
+        // Create root Cargo.toml with workspace.dependencies
+        let root_toml = tmp.join("Cargo.toml");
+        fs::write(
+            &root_toml,
+            r#"[workspace]
+members = ["member_a"]
+
+[workspace.dependencies]
+member_a = { version = "0.1.0", registry = "main_registry" }
+external_dep = { version = "2.0", registry = "main_registry" }
+"#,
+        )
+        .unwrap();
+
+        let member_paths = vec![member_a_dir.clone()];
+
+        // Call patch_crate_for_registry
+        patch_crate_for_registry(
+            &tmp,
+            &member_a_dir,
+            &original_registry,
+            &target_registry,
+            None,
+            &member_paths,
+        )
+        .unwrap();
+
+        // Read and verify root Cargo.toml
+        let root_content = fs::read_to_string(&root_toml).unwrap();
+
+        // member_a should be patched (it's a workspace member)
+        assert!(
+            root_content.contains(r#"member_a = { version = "0.1.0", registry = "my_registry" }"#),
+            "Root Cargo.toml should have member_a patched to my_registry, got:\n{root_content}"
+        );
+
+        // external_dep should NOT be patched (it's not a workspace member)
+        assert!(
+            root_content
+                .contains(r#"external_dep = { version = "2.0", registry = "main_registry" }"#),
+            "Root Cargo.toml should keep external_dep with main_registry, got:\n{root_content}"
+        );
+
+        // Read and verify member_a Cargo.toml
+        let member_content = fs::read_to_string(&member_a_toml).unwrap();
+
+        // some_dep should be patched (blanket-patched in member)
+        assert!(
+            member_content.contains(r#"some_dep = { version = "1.0", registry = "my_registry" }"#),
+            "Member Cargo.toml should have some_dep patched to my_registry, got:\n{member_content}"
+        );
     }
 }
