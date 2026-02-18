@@ -661,7 +661,7 @@ async fn do_test_on_package(
     // Handle Tests
     let test_command = &test_args.test_command;
     let additional_args = &test_args.additional_args;
-    let fslabs_tests: Vec<FslabsTest> = vec![
+    let fslabs_tests: Vec<_> = [
         FslabsTest {
             id: "cargo_fmt".to_string(),
             command: "cargo fmt --verbose -- --check".to_string(),

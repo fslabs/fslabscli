@@ -75,7 +75,7 @@ pub struct PackageRelatedOptions {
     job_limit: usize,
     #[arg(long, env, default_value = "0")]
     inner_job_limit: usize,
-    #[arg(long, env, default_value = "foresight-mining-software-corporation")]
+    #[arg(long, env, default_value = "fsl")]
     cargo_main_registry: String,
     /// Only considers the following packages
     #[arg(long, default_value = "", value_delimiter = ',')]
@@ -86,6 +86,9 @@ pub struct PackageRelatedOptions {
     /// Display progress
     #[arg(long, default_value_t = false)]
     progress: bool,
+    /// Only publish to this cargo registry, skip all others
+    #[arg(long, env)]
+    cargo_target_registry: Option<String>,
 }
 
 #[derive(clap::ValueEnum, Clone, Default, Debug, Serialize)]

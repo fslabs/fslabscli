@@ -128,6 +128,8 @@ pub struct Options {
     hide_dependencies: bool,
     #[arg(long, default_value_t = false)]
     ignore_dev_dependencies: bool,
+    #[arg(long, default_value_t = false)]
+    force_publish: bool,
     #[clap(flatten)]
     diff: DiffOptions,
 }
@@ -154,6 +156,11 @@ impl Options {
 
     pub fn with_ignore_dev_dependencies(mut self, ignore_dev_dependencies: bool) -> Self {
         self.ignore_dev_dependencies = ignore_dev_dependencies;
+        self
+    }
+
+    pub fn with_force_publish(mut self, force_publish: bool) -> Self {
+        self.force_publish = force_publish;
         self
     }
 
@@ -667,6 +674,7 @@ impl Result {
         skip_binary: bool,
         skip_s3: bool,
         binary_store: &Option<BinaryStore>,
+        force_publish: bool,
     ) -> anyhow::Result<()> {
         if !skip_docker {
             match self
@@ -699,6 +707,7 @@ impl Result {
                     self.version.clone(),
                     cargo,
                     force_cargo,
+                    force_publish,
                 )
                 .await
             {
@@ -1096,6 +1105,11 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
                 if package.ignored {
                     continue;
                 }
+                if let Some(ref target) = self.common_options.cargo_target_registry
+                    && let Some(ref mut registries) = package.publish_detail.cargo.registries
+                {
+                    registries.retain(|r| r == target);
+                }
                 if self.options.check_publish {
                     match package
                         .check_publishable(
@@ -1109,6 +1123,7 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
                             self.options.skip_binary,
                             self.options.skip_s3,
                             &binary_store,
+                            self.options.force_publish,
                         )
                         .await
                     {
@@ -1128,6 +1143,9 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
                             }
                         }
                     }
+                }
+                if let Some(ref target) = self.common_options.cargo_target_registry {
+                    package.publish_detail.cargo.filter_target_registry(target);
                 }
 
                 package.publish = vec![

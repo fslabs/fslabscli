@@ -5,7 +5,7 @@ description = "API for use within tests that depend on the fslabscli test runner
 authors = ["FSLABS DevOps Gods"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-publish = ["foresight-mining-software-corporation"]
+publish = ["fsl"]
 repository = "https://github.com/ForesightMiningSoftwareCorporation/fslabsci"
 
 [dependencies]
@@ -14,4 +14,3 @@ url = "2.5.7"
 
 [package.metadata.fslabs.publish.cargo]
 publish = true
-alternate_registries = ["fslabs-nominal"]

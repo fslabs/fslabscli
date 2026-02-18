@@ -13,3 +13,14 @@ result
 logs/
 output/
 result/
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+*.der
+
+# Credential and secret files
+*.credentials
+secrets.yaml
