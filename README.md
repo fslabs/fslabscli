@@ -16,7 +16,7 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 ## Installation
 
 To install, run the following command:
-``cargo install --git https://github.com/ForesightMiningSoftwareCorporation/fslabscli``
+``cargo install --git https://github.com/fslabs/fslabscli``
 
 ## Release Process
 ``` mermaid
