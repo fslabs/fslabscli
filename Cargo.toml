@@ -6,7 +6,7 @@ license = "MIT OR Apache-2.0"
 name = "cargo-fslabscli"
 publish = ["fsl"]
 repository = "https://github.com/fslabs/fslabsci"
-version = "2.35.0"
+version = "2.36.0"
 
 [package.metadata.fslabs.publish.binary]
 name = "FSLABS Cli tool"
@@ -96,10 +96,18 @@ version = "1.0.100"
 features = ["derive", "env"]
 version = "4.5.51"
 
-[dependencies.git2]
+[dependencies.gix]
+version = "0.79.0"
 default-features = false
-version = "0.20.2"
-features = ["vendored-openssl", "https", "ssh"]
+features = [
+    "blocking-network-client",
+    "revision",
+    "blob-diff",
+    "status",
+    "index",
+    "credentials",
+    "worktree-mutation",
+]
 
 [dependencies.humanize-duration]
 features = ["chrono"]

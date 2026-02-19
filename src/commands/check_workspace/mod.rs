@@ -1,6 +1,5 @@
 use chrono::{Duration, prelude::*};
 use core::result::Result as CoreResult;
-use git2::Repository;
 use std::cmp;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -1241,11 +1240,11 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
                 ));
             }
 
-            let repo = Repository::open(self.repo_root)?;
-            let (base_commit, head_commit) = diff_strategy.git_commits(&repo)?;
+            let repo = gix::open(&self.repo_root)?;
+            let (base_commit_id, head_commit_id) = diff_strategy.git_commits(&repo)?;
             // Check changed from a git pov
             let changed_package_paths =
-                crates.changed_packages(&repo, base_commit, head_commit, &diff_strategy)?;
+                crates.changed_packages(&repo, base_commit_id, head_commit_id, &diff_strategy)?;
             tracing::info!("Changed packages: {changed_package_paths:#?}");
             // Any packages that transitively depend on changed packages are also considered "changed".
             let changed_closure = crates

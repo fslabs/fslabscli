@@ -1,5 +1,5 @@
 use clap::{Parser, ValueEnum};
-use git2::{Object, Repository};
+use gix::Repository;
 use serde::Serialize;
 use std::fmt;
 
@@ -21,29 +21,25 @@ pub enum DiffStrategy {
 }
 
 impl DiffStrategy {
-    pub fn git_commits<'r>(
-        &self,
-        repo: &'r Repository,
-    ) -> anyhow::Result<(Object<'r>, Object<'r>)> {
+    pub fn git_commits(&self, repo: &Repository) -> anyhow::Result<(gix::ObjectId, gix::ObjectId)> {
         match self {
             DiffStrategy::Explicit { base, head } => {
-                let head_commit = repo.revparse_single(head)?;
-                let base_commit = repo.revparse_single(base)?;
-                Ok((base_commit, head_commit))
+                let head_id = repo.rev_parse_single(head.as_str())?.detach();
+                let base_id = repo.rev_parse_single(base.as_str())?.detach();
+                Ok((base_id, head_id))
             }
             DiffStrategy::LocalChanges | DiffStrategy::All => {
-                // Compare HEAD~ vs HEAD (last commit changes)
-                // Falls back to HEAD vs HEAD if no parent exists (single commit repo)
-                let head_commit = repo.revparse_single("HEAD")?;
-                let base_commit = repo
-                    .revparse_single("HEAD~")
-                    .unwrap_or_else(|_| head_commit.clone());
-                Ok((base_commit, head_commit))
+                let head_id = repo.rev_parse_single("HEAD")?.detach();
+                let base_id = repo
+                    .rev_parse_single("HEAD~")
+                    .map(|id| id.detach())
+                    .unwrap_or(head_id);
+                Ok((base_id, head_id))
             }
             DiffStrategy::WorktreeVsBranch { branch } => {
-                let head_commit = repo.revparse_single("HEAD")?;
-                let base_commit = repo.revparse_single(branch)?;
-                Ok((base_commit, head_commit))
+                let head_id = repo.rev_parse_single("HEAD")?.detach();
+                let base_id = repo.rev_parse_single(branch.as_str())?.detach();
+                Ok((base_id, head_id))
             }
         }
     }
@@ -95,157 +91,194 @@ impl DiffOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use git2::{Oid, Signature, Time};
     use std::fs;
+    use std::process::Command;
     use tempfile::TempDir;
 
+    fn git(repo_path: &std::path::Path) -> Command {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(repo_path);
+        cmd.env("GIT_AUTHOR_NAME", "Test User");
+        cmd.env("GIT_AUTHOR_EMAIL", "test@example.com");
+        cmd.env("GIT_COMMITTER_NAME", "Test User");
+        cmd.env("GIT_COMMITTER_EMAIL", "test@example.com");
+        cmd
+    }
+
+    fn get_commit_sha(repo_path: &std::path::Path, rev: &str) -> String {
+        let output = git(repo_path)
+            .args(["rev-parse", rev])
+            .output()
+            .expect("Failed to get commit SHA");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
     // Test helper to create a repo with commits
-    fn setup_test_repo() -> (TempDir, Oid, Oid) {
+    fn setup_test_repo() -> (TempDir, String, String) {
         let temp_dir = TempDir::new().unwrap();
-        let repo = Repository::init(temp_dir.path()).unwrap();
+
+        // Initialize repo
+        let output = git(temp_dir.path())
+            .arg("init")
+            .output()
+            .expect("Failed to init repo");
+        assert!(output.status.success());
 
         // Configure repo
-        let mut config = repo.config().unwrap();
-        config.set_str("user.name", "Test User").unwrap();
-        config.set_str("user.email", "test@example.com").unwrap();
-
-        let sig =
-            Signature::new("Test User", "test@example.com", &Time::new(1234567890, 0)).unwrap();
+        let output = git(temp_dir.path())
+            .args(["config", "commit.gpgsign", "false"])
+            .output()
+            .expect("Failed to configure git");
+        assert!(output.status.success());
 
         // Create first commit
-        let tree_id = {
-            let mut index = repo.index().unwrap();
-            fs::write(temp_dir.path().join("file1.txt"), "content1").unwrap();
-            index.add_path(std::path::Path::new("file1.txt")).unwrap();
-            index.write().unwrap();
-            index.write_tree().unwrap()
-        };
+        fs::write(temp_dir.path().join("file1.txt"), "content1").unwrap();
+        let output = git(temp_dir.path())
+            .args(["add", "file1.txt"])
+            .output()
+            .expect("Failed to add file");
+        assert!(output.status.success());
 
-        let tree = repo.find_tree(tree_id).unwrap();
-        let first_commit = repo
-            .commit(Some("HEAD"), &sig, &sig, "First commit", &tree, &[])
-            .unwrap();
+        let output = git(temp_dir.path())
+            .args(["commit", "-m", "First commit"])
+            .output()
+            .expect("Failed to commit");
+        assert!(output.status.success());
+
+        let first_commit = get_commit_sha(temp_dir.path(), "HEAD");
 
         // Create second commit
-        let tree_id = {
-            let mut index = repo.index().unwrap();
-            fs::write(temp_dir.path().join("file2.txt"), "content2").unwrap();
-            index.add_path(std::path::Path::new("file2.txt")).unwrap();
-            index.write().unwrap();
-            index.write_tree().unwrap()
-        };
+        fs::write(temp_dir.path().join("file2.txt"), "content2").unwrap();
+        let output = git(temp_dir.path())
+            .args(["add", "file2.txt"])
+            .output()
+            .expect("Failed to add file");
+        assert!(output.status.success());
 
-        let tree = repo.find_tree(tree_id).unwrap();
-        let parent = repo.find_commit(first_commit).unwrap();
-        let second_commit = repo
-            .commit(Some("HEAD"), &sig, &sig, "Second commit", &tree, &[&parent])
-            .unwrap();
+        let output = git(temp_dir.path())
+            .args(["commit", "-m", "Second commit"])
+            .output()
+            .expect("Failed to commit");
+        assert!(output.status.success());
+
+        let second_commit = get_commit_sha(temp_dir.path(), "HEAD");
 
         (temp_dir, first_commit, second_commit)
     }
 
     #[test]
     fn test_diff_strategy_local_changes() {
-        let (temp_dir, first_oid, second_oid) = setup_test_repo();
-        let repo = Repository::open(temp_dir.path()).unwrap();
+        let (temp_dir, first_sha, second_sha) = setup_test_repo();
+        let repo = gix::open(temp_dir.path()).unwrap();
         let strategy = DiffStrategy::LocalChanges;
 
         let (base, head) = strategy.git_commits(&repo).unwrap();
 
         // LocalChanges compares HEAD~ vs HEAD
-        assert_eq!(base.id(), first_oid);
-        assert_eq!(head.id(), second_oid);
+        assert_eq!(base.to_string(), first_sha);
+        assert_eq!(head.to_string(), second_sha);
     }
 
     #[test]
     fn test_diff_strategy_local_changes_single_commit() {
         // Test that LocalChanges works even with just one commit
         let temp_dir = TempDir::new().unwrap();
-        let repo = Repository::init(temp_dir.path()).unwrap();
+
+        // Initialize repo
+        let output = git(temp_dir.path())
+            .arg("init")
+            .output()
+            .expect("Failed to init repo");
+        assert!(output.status.success());
 
         // Configure repo
-        let mut config = repo.config().unwrap();
-        config.set_str("user.name", "Test User").unwrap();
-        config.set_str("user.email", "test@example.com").unwrap();
-
-        let sig =
-            Signature::new("Test User", "test@example.com", &Time::new(1234567890, 0)).unwrap();
+        let output = git(temp_dir.path())
+            .args(["config", "commit.gpgsign", "false"])
+            .output()
+            .expect("Failed to configure git");
+        assert!(output.status.success());
 
         // Create single commit
-        let tree_id = {
-            let mut index = repo.index().unwrap();
-            fs::write(temp_dir.path().join("file1.txt"), "content1").unwrap();
-            index.add_path(std::path::Path::new("file1.txt")).unwrap();
-            index.write().unwrap();
-            index.write_tree().unwrap()
-        };
+        fs::write(temp_dir.path().join("file1.txt"), "content1").unwrap();
+        let output = git(temp_dir.path())
+            .args(["add", "file1.txt"])
+            .output()
+            .expect("Failed to add file");
+        assert!(output.status.success());
 
-        let tree = repo.find_tree(tree_id).unwrap();
-        let commit_oid = repo
-            .commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
-            .unwrap();
+        let output = git(temp_dir.path())
+            .args(["commit", "-m", "Initial commit"])
+            .output()
+            .expect("Failed to commit");
+        assert!(output.status.success());
 
+        let commit_sha = get_commit_sha(temp_dir.path(), "HEAD");
+
+        let repo = gix::open(temp_dir.path()).unwrap();
         let strategy = DiffStrategy::LocalChanges;
         let (base, head) = strategy.git_commits(&repo).unwrap();
 
         // Should successfully return HEAD vs HEAD even with single commit
-        assert_eq!(base.id(), commit_oid);
-        assert_eq!(head.id(), commit_oid);
+        assert_eq!(base.to_string(), commit_sha);
+        assert_eq!(head.to_string(), commit_sha);
     }
 
     #[test]
     fn test_diff_strategy_explicit() {
-        let (temp_dir, first_oid, second_oid) = setup_test_repo();
-        let repo = Repository::open(temp_dir.path()).unwrap();
+        let (temp_dir, first_sha, second_sha) = setup_test_repo();
+        let repo = gix::open(temp_dir.path()).unwrap();
         let strategy = DiffStrategy::Explicit {
-            base: first_oid.to_string(),
-            head: second_oid.to_string(),
+            base: first_sha.clone(),
+            head: second_sha.clone(),
         };
 
         let (base, head) = strategy.git_commits(&repo).unwrap();
 
-        assert_eq!(base.id(), first_oid);
-        assert_eq!(head.id(), second_oid);
+        assert_eq!(base.to_string(), first_sha);
+        assert_eq!(head.to_string(), second_sha);
     }
 
     #[test]
     fn test_diff_strategy_explicit_short_sha() {
-        let (temp_dir, first_oid, second_oid) = setup_test_repo();
-        let repo = Repository::open(temp_dir.path()).unwrap();
+        let (temp_dir, first_sha, second_sha) = setup_test_repo();
+        let repo = gix::open(temp_dir.path()).unwrap();
         let strategy = DiffStrategy::Explicit {
-            base: first_oid.to_string()[..7].to_string(),
-            head: second_oid.to_string()[..7].to_string(),
+            base: first_sha[..7].to_string(),
+            head: second_sha[..7].to_string(),
         };
 
         let (base, head) = strategy.git_commits(&repo).unwrap();
 
-        assert_eq!(base.id(), first_oid);
-        assert_eq!(head.id(), second_oid);
+        assert_eq!(base.to_string(), first_sha);
+        assert_eq!(head.to_string(), second_sha);
     }
 
     #[test]
     fn test_diff_strategy_worktree_vs_branch() {
-        let (temp_dir, first_oid, second_oid) = setup_test_repo();
-        let repo = Repository::open(temp_dir.path()).unwrap();
+        let (temp_dir, first_sha, second_sha) = setup_test_repo();
 
         // Create a branch pointing to first commit
-        repo.branch("test-branch", &repo.find_commit(first_oid).unwrap(), false)
-            .unwrap();
+        let output = git(temp_dir.path())
+            .args(["branch", "test-branch", &first_sha])
+            .output()
+            .expect("Failed to create branch");
+        assert!(output.status.success());
 
+        let repo = gix::open(temp_dir.path()).unwrap();
         let strategy = DiffStrategy::WorktreeVsBranch {
             branch: "test-branch".to_string(),
         };
 
         let (base, head) = strategy.git_commits(&repo).unwrap();
 
-        assert_eq!(base.id(), first_oid);
-        assert_eq!(head.id(), second_oid); // HEAD is still at second commit
+        assert_eq!(base.to_string(), first_sha);
+        assert_eq!(head.to_string(), second_sha); // HEAD is still at second commit
     }
 
     #[test]
     fn test_diff_strategy_explicit_invalid_sha() {
-        let (temp_dir, _first_oid, _second_oid) = setup_test_repo();
-        let repo = Repository::open(temp_dir.path()).unwrap();
+        let (temp_dir, _first_sha, _second_sha) = setup_test_repo();
+        let repo = gix::open(temp_dir.path()).unwrap();
         let strategy = DiffStrategy::Explicit {
             base: "invalid".to_string(),
             head: "also-invalid".to_string(),
@@ -257,8 +290,8 @@ mod tests {
 
     #[test]
     fn test_diff_strategy_worktree_vs_branch_invalid() {
-        let (temp_dir, _first_oid, _second_oid) = setup_test_repo();
-        let repo = Repository::open(temp_dir.path()).unwrap();
+        let (temp_dir, _first_sha, _second_sha) = setup_test_repo();
+        let repo = gix::open(temp_dir.path()).unwrap();
         let strategy = DiffStrategy::WorktreeVsBranch {
             branch: "nonexistent-branch".to_string(),
         };

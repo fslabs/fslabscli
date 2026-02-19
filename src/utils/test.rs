@@ -5,9 +5,31 @@ use std::{
     process::Command,
 };
 
-use git2::{Repository, Signature};
+fn git(repo_path: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(repo_path);
+    cmd.env("GIT_AUTHOR_NAME", "Test User");
+    cmd.env("GIT_AUTHOR_EMAIL", "test@example.com");
+    cmd.env("GIT_COMMITTER_NAME", "Test User");
+    cmd.env("GIT_COMMITTER_EMAIL", "test@example.com");
+    cmd
+}
 
-pub fn commit_all_changes(repo_path: &PathBuf, message: &str) {
+pub fn init_repo(repo_path: &Path) {
+    let output = git(repo_path)
+        .arg("init")
+        .output()
+        .expect("Failed to run git init");
+    assert!(output.status.success(), "git init failed: {:?}", output);
+
+    let output = git(repo_path)
+        .args(["config", "commit.gpgsign", "false"])
+        .output()
+        .expect("Failed to configure git");
+    assert!(output.status.success());
+}
+
+pub fn commit_all_changes(repo_path: &Path, message: &str) {
     stage_all(repo_path);
     commit_repo(repo_path, message);
 }
@@ -22,53 +44,28 @@ pub fn modify_file(repo_path: &Path, file_path: &str, content: &str) {
     std::fs::write(&full_path, content).expect("Failed to write to file");
 }
 
-pub fn stage_file(repo_path: &PathBuf, file_path: &str) {
-    let repo = Repository::open(repo_path).expect("Failed to open repo");
-    let mut index = repo.index().unwrap();
-    index
-        .add_all([file_path].iter(), git2::IndexAddOption::DEFAULT, None)
-        .expect("Failed to add files to index");
-    index.write().expect("Failed to write index");
+pub fn stage_file(repo_path: &Path, file_path: &str) {
+    let output = git(repo_path)
+        .args(["add", file_path])
+        .output()
+        .expect("Failed to run git add");
+    assert!(output.status.success(), "git add failed: {:?}", output);
 }
 
-pub fn stage_all(repo_path: &PathBuf) {
-    stage_file(repo_path, "*");
+pub fn stage_all(repo_path: &Path) {
+    let output = git(repo_path)
+        .args(["add", "-A"])
+        .output()
+        .expect("Failed to run git add -A");
+    assert!(output.status.success(), "git add -A failed: {:?}", output);
 }
 
-pub fn commit_repo(repo_path: &PathBuf, commit_message: &str) {
-    let repo = Repository::open(repo_path).expect("Failed to open repo");
-    let mut index = repo.index().unwrap();
-
-    let oid = index.write_tree().unwrap();
-    let signature = Signature::now("Test User", "test@example.com").unwrap();
-    let tree = repo.find_tree(oid).unwrap();
-    let parent_commit = repo
-        .head()
-        .ok()
-        .and_then(|r| r.target())
-        .and_then(|oid| repo.find_commit(oid).ok());
-
-    if let Some(parent) = parent_commit {
-        repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            commit_message,
-            &tree,
-            &[&parent],
-        )
-        .unwrap();
-    } else {
-        repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            commit_message,
-            &tree,
-            &[],
-        )
-        .unwrap();
-    };
+pub fn commit_repo(repo_path: &Path, commit_message: &str) {
+    let output = git(repo_path)
+        .args(["commit", "-m", commit_message, "--allow-empty"])
+        .output()
+        .expect("Failed to run git commit");
+    assert!(output.status.success(), "git commit failed: {:?}", output);
 }
 
 pub static FAKE_REGISTRY: &str = "fake-registry";
@@ -154,18 +151,7 @@ pub fn create_complex_workspace(alt_registry: bool) -> PathBuf {
         .into_persistent()
         .to_path_buf();
 
-    let repo = Repository::init(&tmp).expect("Failed to init repo");
-
-    // Configure Git user info (required for commits)
-    repo.config()
-        .unwrap()
-        .set_str("user.name", "Test User")
-        .unwrap();
-    repo.config()
-        .unwrap()
-        .set_str("user.email", "test@example.com")
-        .unwrap();
-    repo.config().unwrap().set_str("gpg.sign", "false").unwrap();
+    init_repo(&tmp);
 
     initialize_workspace(
         &tmp,
@@ -242,7 +228,7 @@ pub fn create_rust_index(checksum: &str) -> PathBuf {
         .into_persistent()
         .to_path_buf();
 
-    let _repo = Repository::init(&tmp).expect("Failed to init repo");
+    init_repo(&tmp);
 
     // Create config.json
     let config_path = tmp.join("config.json");

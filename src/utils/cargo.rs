@@ -3,8 +3,6 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 
 use anyhow::Context;
-use git2::build::RepoBuilder;
-use git2::{Cred, FetchOptions, RemoteCallbacks};
 use http_body_util::BodyExt;
 use http_body_util::Empty;
 use hyper::body::Bytes;
@@ -178,22 +176,31 @@ impl CargoRegistry {
         let tmp = TempDir::new()?.dont_delete_on_drop();
         let path = tmp.path();
 
-        let mut builder = RepoBuilder::new();
-        let mut callbacks = RemoteCallbacks::new();
-        let mut fetch_options = FetchOptions::new();
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("clone").arg("--depth=1");
 
-        let private_key = self.private_key.clone();
+        if let Some(key) = &self.private_key {
+            if !key.is_file() {
+                anyhow::bail!("SSH key path does not exist or is not a file: {:?}", key);
+            }
+            let ssh_command = format!(
+                "ssh -i '{}' -o IdentitiesOnly=yes -o StrictHostKeyChecking=no",
+                key.display().to_string().replace("'", "'\\''")
+            );
+            cmd.env("GIT_SSH_COMMAND", ssh_command);
+        }
 
-        callbacks.credentials(move |_, u, _| match private_key.as_ref() {
-            Some(key) => Cred::ssh_key(u.unwrap_or("git"), None, key.as_path(), None),
-            None => Cred::ssh_key_from_agent(u.unwrap_or("git")),
-        });
-        fetch_options.remote_callbacks(callbacks);
-        builder.fetch_options(fetch_options);
-        builder.clone(&index, path).map_err(|e| {
+        cmd.arg(&index).arg(path);
+
+        let output = cmd.output().map_err(|e| {
             println!("Couldn't not fetch reg: {}", e);
             e
         })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("git clone failed: {}", stderr);
+        }
         self.local_index_path = Some(path.to_path_buf());
         Ok(())
     }
