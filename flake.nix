@@ -29,7 +29,7 @@
         fenixPkgs = fenix.packages.${system};
         toolchain = fenixPkgs.fromToolchainFile {
           file = ./rust-toolchain.toml;
-          sha256 = "sha256-+9FmLhAOezBZCOziO0Qct1NOrfpjNsXxc/8I0c7BdKE=";
+          sha256 = "sha256-SBKjxhC6zHTu0SyJwxLlQHItzMzYZ71VCWQC2hOzpRY=";
         };
         craneLib = (crane.mkLib pkgs).overrideToolchain toolchain;
         manifest = (pkgs.lib.importTOML ./Cargo.toml).package;
@@ -79,7 +79,8 @@
             pkgs.git
             pkgs.installShellFiles # Shell Completions
             pkgs.rustPlatform.bindgenHook
-          ] ++ lib.optionals isDarwin [
+          ]
+          ++ lib.optionals isDarwin [
             pkgs.libiconv
           ];
           buildInputs = [
@@ -189,9 +190,9 @@
             ) arch2targets;
           in
           lib.attrsets.mapAttrs' (
-            arch: _: lib.nameValuePair (packageName + "-" + arch) (
-              if arch == system then mkRustPackage packageName
-              else mkCrossRustPackage arch packageName
+            arch: _:
+            lib.nameValuePair (packageName + "-" + arch) (
+              if arch == system then mkRustPackage packageName else mkCrossRustPackage arch packageName
             )
           ) filteredTargets;
       in
@@ -241,13 +242,7 @@
                   c.enable = false;
                   rust = {
                     enable = true;
-                    toolchainPackage =
-                      with fenixPkgs;
-                      combine [
-                        minimal.cargo
-                        minimal.rustc
-                        targets.wasm32-unknown-unknown.latest.rust-std
-                      ];
+                    toolchainPackage = toolchain;
                   };
                 };
 
