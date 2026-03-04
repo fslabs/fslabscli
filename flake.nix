@@ -54,18 +54,18 @@
               pkgsCross = generateCross rustTarget;
               depsBuildBuild = [ pkgsCross.libiconv ];
             };
-            "x86_64-windows" =
-              let
-                pkgsCross = pkgs.pkgsCross.mingwW64;
-              in
-              {
-                inherit pkgsCross;
-                rustTarget = "x86_64-pc-windows-gnu";
-                depsBuildBuild = [
-                  pkgsCross.stdenv.cc
-                  pkgsCross.windows.pthreads
-                ];
-              };
+            # "x86_64-windows" =
+            #   let
+            #     pkgsCross = pkgs.pkgsCross.mingwW64;
+            #   in
+            #   {
+            #     inherit pkgsCross;
+            #     rustTarget = "x86_64-pc-windows-gnu";
+            #     depsBuildBuild = [
+            #       pkgsCross.stdenv.cc
+            #       pkgsCross.windows.pthreads
+            #     ];
+            #   };
           };
 
         generateCommonArgs = craneLib': {
@@ -79,6 +79,8 @@
             pkgs.git
             pkgs.installShellFiles # Shell Completions
             pkgs.rustPlatform.bindgenHook
+          ] ++ lib.optionals isDarwin [
+            pkgs.libiconv
           ];
           buildInputs = [
             pkgs.stdenv.cc
@@ -136,7 +138,6 @@
             commonArgs = (generateCommonArgs craneLibCross) // {
               depsBuildBuild = depsBuildBuild ++ [
                 pkgsCross.buildPackages.perl
-                pkgsCross.buildPackages.openssl
               ];
               inherit TARGET_CC;
 
@@ -152,9 +153,6 @@
 
               CC = "${pkgsCross.stdenv.cc}/bin/${pkgsCross.stdenv.cc.targetPrefix}cc";
               LD = "${pkgsCross.stdenv.cc}/bin/${pkgsCross.stdenv.cc.targetPrefix}cc";
-              OPENSSL_STATIC = "1";
-              OPENSSL_NO_VENDOR = "0";
-              PKG_CONFIG_ALL_STATIC = "1";
             };
             cargoArtifacts = craneLibCross.buildDepsOnly (commonArgs // { });
 
@@ -191,7 +189,10 @@
             ) arch2targets;
           in
           lib.attrsets.mapAttrs' (
-            arch: _: lib.nameValuePair (packageName + "-" + arch) (mkCrossRustPackage arch packageName)
+            arch: _: lib.nameValuePair (packageName + "-" + arch) (
+              if arch == system then mkRustPackage packageName
+              else mkCrossRustPackage arch packageName
+            )
           ) filteredTargets;
       in
       {
@@ -237,6 +238,7 @@
                     fenixPkgs.rust-analyzer
                   ];
                 languages = {
+                  c.enable = false;
                   rust = {
                     enable = true;
                     toolchainPackage =

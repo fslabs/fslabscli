@@ -1,7 +1,8 @@
 #[cfg(test)]
 use cargo_metadata::semver::Version;
 use cargo_metadata::{CargoOpt, DependencyKind, Metadata, MetadataCommand, Package, PackageId};
-use git2::{DiffDelta, Object, Repository};
+use gix::Repository;
+use gix::bstr::ByteSlice;
 use ignore::gitignore::Gitignore;
 use std::{
     borrow::Cow,
@@ -158,85 +159,90 @@ impl CrateGraph {
     }
 
     /// Determines which packages have changed between `old_rev` and `new_rev`. (Un)Staged changes are considered
-    pub fn changed_packages<'r>(
+    pub fn changed_packages(
         &self,
-        repository: &'r Repository,
-        old_commit: Object<'r>,
-        new_commit: Object<'r>,
+        repository: &Repository,
+        old_commit_id: gix::ObjectId,
+        new_commit_id: gix::ObjectId,
         diff_strategy: &DiffStrategy,
     ) -> anyhow::Result<Vec<PathBuf>> {
-        // Create git diff between revisions.
-        let old_tree = old_commit.peel_to_tree()?;
-        let new_tree = new_commit.peel_to_tree()?;
+        let old_tree = repository.find_commit(old_commit_id)?.tree()?;
+        let new_tree = repository.find_commit(new_commit_id)?.tree()?;
 
-        // Get index and working directory state
-        let index = repository.index()?;
-
-        // Create diffs:
-        // - one between old_rev and new_rev,
-        // - and another between new_rev and current state staged
-        // - and another between new_rev and current state unstaged
-        let diff_old_new = repository.diff_tree_to_tree(Some(&old_tree), Some(&new_tree), None)?;
-        let diff_new_staged = repository.diff_tree_to_index(Some(&new_tree), Some(&index), None)?;
-        let diff_new_unstaged = repository.diff_index_to_workdir(Some(&index), None)?;
-
-        // Check each package path against each file paths in git diff.
         let mut changed = Vec::new();
         let mut packages = self.packages().collect::<Vec<_>>();
-        // Sort packages so that we look at the subpackages first:
-        // - workspace/crate_a/subcrate
-        // - workspace/crate_a
-        // - workspace/crate_b
-        // - workspace
         packages.sort_by_key(|package| package_path(&self.repo_root, package).iter().count());
         packages.reverse();
 
-        // For each change, find the most specific package modified
-        let mut file_cb = |delta: DiffDelta, _: f32| -> bool {
-            for delta_path in [delta.old_file().path(), delta.new_file().path()]
-                .into_iter()
-                .flatten()
-            {
-                for package in &packages {
-                    let package_path = package_path(&self.repo_root, package).into_owned();
-
-                    // If package_path is ".", treat it as the entire repo
-                    let is_repo_root = package_path == Path::new(".");
-
-                    if delta_path.ends_with("rust-toolchain.toml") {
-                        // We have a special case, the `rust-toolchain.toml` file, if it changed, everything should be considered as changed
-                        changed.push(package_path.clone());
-                        continue;
-                    }
-                    if is_repo_root
-                        || delta_path.starts_with(&package_path)
-                        || delta_path.ends_with("rust-toolchain.toml")
-                    {
-                        changed.push(package_path.clone());
-                        // Stop processing this change, we found the most specific package impacted
-                        // Returning true will continue matching other file changed in case a commit targets several packages
-                        return true;
-                    }
+        let mut record_change = |delta_path: &Path| {
+            for package in &packages {
+                let pkg_path = package_path(&self.repo_root, package).into_owned();
+                let is_repo_root = pkg_path == Path::new(".");
+                if delta_path.ends_with("rust-toolchain.toml") {
+                    changed.push(pkg_path.clone());
+                    continue;
+                }
+                if is_repo_root || delta_path.starts_with(&pkg_path) {
+                    changed.push(pkg_path.clone());
+                    return;
                 }
             }
-            true
         };
-        // Returning early from a callback will propagate an error for some
-        // reason. Ignore it.
-        let _ = diff_old_new.foreach(&mut file_cb, None, None, None);
 
-        // Only check changes on staged and unstaged when not using the explicit strategy
+        // Tree-to-tree diff (gix native)
+        old_tree
+            .changes()?
+            .for_each_to_obtain_tree(&new_tree, |change| {
+                match change.location().to_path() {
+                    Ok(path) => {
+                        record_change(path);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Skipping non-UTF8 path in diff: {}", e);
+                    }
+                }
+                Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Continue(()))
+            })?;
+
+        // Staged + unstaged (git CLI, only for non-Explicit strategies)
         match diff_strategy {
             DiffStrategy::Explicit { .. } => {}
             _ => {
-                let _ = diff_new_staged.foreach(&mut file_cb, None, None, None);
-                let _ = diff_new_unstaged.foreach(&mut file_cb, None, None, None);
+                // Staged: diff new_commit tree vs current index
+                let output = std::process::Command::new("git")
+                    .args([
+                        "diff",
+                        "--cached",
+                        "--name-only",
+                        &new_commit_id.to_string(),
+                    ])
+                    .current_dir(&self.repo_root)
+                    .output()?;
+                if output.status.success() {
+                    for line in String::from_utf8_lossy(&output.stdout).lines() {
+                        if !line.is_empty() {
+                            record_change(Path::new(line));
+                        }
+                    }
+                }
+
+                // Unstaged: diff index vs workdir
+                let output = std::process::Command::new("git")
+                    .args(["diff", "--name-only"])
+                    .current_dir(&self.repo_root)
+                    .output()?;
+                if output.status.success() {
+                    for line in String::from_utf8_lossy(&output.stdout).lines() {
+                        if !line.is_empty() {
+                            record_change(Path::new(line));
+                        }
+                    }
+                }
             }
         }
 
         changed.sort();
-        changed.dedup(); // Remove duplicates if package changed in multiple diffs
-
+        changed.dedup();
         Ok(changed)
     }
 }
@@ -559,8 +565,8 @@ pub fn find_git_root(start: impl AsRef<Path>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use crate::utils::test::{
-        FAKE_REGISTRY, commit_all_changes, commit_repo, create_complex_workspace, modify_file,
-        stage_file,
+        FAKE_REGISTRY, commit_all_changes, commit_repo, create_complex_workspace, init_repo,
+        modify_file, stage_file,
     };
 
     use super::*;
@@ -666,7 +672,7 @@ mod tests {
     fn test_detect_changed_packages() {
         let repo_root = initialize_repo();
         let graph = CrateGraph::new(&repo_root, "", None).unwrap();
-        let repo = Repository::open(repo_root).unwrap();
+        let repo = gix::open(repo_root).unwrap();
         // Use LocalChanges strategy to compare HEAD~ vs HEAD
         let diff_strategy = DiffStrategy::LocalChanges;
         let (base_commit, head_commit) = diff_strategy.git_commits(&repo).unwrap();
@@ -683,7 +689,7 @@ mod tests {
     fn test_detect_changed_package_single_rust_crate() {
         let repo_root = create_simple_rust_crate();
         let graph = CrateGraph::new(&repo_root, "", None).unwrap();
-        let repo = Repository::open(repo_root).unwrap();
+        let repo = gix::open(repo_root).unwrap();
         // Use LocalChanges strategy to compare HEAD~ vs HEAD
         let diff_strategy = DiffStrategy::LocalChanges;
         let (base_commit, head_commit) = diff_strategy.git_commits(&repo).unwrap();
@@ -699,7 +705,7 @@ mod tests {
         let repo_root = create_simple_rust_crate();
         let graph = CrateGraph::new(&repo_root, "", None).unwrap();
         modify_file(&repo_root, "src/lib.rs", "pub fn new_function_again() {}");
-        let repo = Repository::open(repo_root).unwrap();
+        let repo = gix::open(repo_root).unwrap();
         let diff_strategy = DiffStrategy::WorktreeVsBranch {
             branch: "HEAD".to_string(),
         };
@@ -718,7 +724,7 @@ mod tests {
         modify_file(&repo_root, "src/lib.rs", "pub fn new_function_again() {}");
         stage_file(&repo_root, "src/lib.rs");
 
-        let repo = Repository::open(repo_root).unwrap();
+        let repo = gix::open(repo_root).unwrap();
         let diff_strategy = DiffStrategy::WorktreeVsBranch {
             branch: "HEAD".to_string(),
         };
@@ -753,18 +759,7 @@ mod tests {
             .into_persistent()
             .to_path_buf();
 
-        let repo = Repository::init(&tmp).expect("Failed to init repo");
-
-        // Configure Git user info (required for commits)
-        repo.config()
-            .unwrap()
-            .set_str("user.name", "Test User")
-            .unwrap();
-        repo.config()
-            .unwrap()
-            .set_str("user.email", "test@example.com")
-            .unwrap();
-        repo.config().unwrap().set_str("gpg.sign", "false").unwrap();
+        init_repo(&tmp);
 
         Command::new("cargo")
             .arg("init")
