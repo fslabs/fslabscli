@@ -21,7 +21,6 @@ use std::{
 use temp_dir::TempDir;
 use tokio::runtime::Handle;
 use toml_edit::{DocumentMut, Table, table, value};
-use tracing::warn;
 use walkdir::WalkDir;
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
@@ -349,31 +348,6 @@ impl CargoRegistry {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Default, Debug)]
-struct CargoPackageVersion {
-    #[serde(alias = "vers", alias = "num")]
-    pub version: String,
-}
-
-#[derive(Serialize, Deserialize, Clone, Default, Debug)]
-struct CargoPackage {
-    name: String,
-    versions: Vec<CargoPackageVersion>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Default, Debug)]
-struct CargoSinglePackage {
-    name: String,
-}
-
-#[derive(Serialize, Deserialize, Clone, Default, Debug)]
-struct CargoSearchResult {
-    crates: Option<Vec<CargoPackage>>,
-    #[serde(rename = "crate")]
-    single_crate: Option<CargoSinglePackage>,
-    versions: Option<Vec<CargoPackageVersion>>,
-}
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Cargo {
     #[serde(rename = "registry", default)]
@@ -505,149 +479,82 @@ impl CrateChecker for Cargo {
                 .as_ref()
                 .context("HTTP client required for sparse registry")?;
 
-            let mut req_builder = Request::builder().method(Method::GET).uri(url.clone());
-
-            if let Some(token) = &registry.token {
-                req_builder = req_builder.header("Authorization", token);
-            }
-
-            if let Some(user_agent) = &registry.user_agent {
-                req_builder = req_builder.header("User-Agent", user_agent);
-            }
-
-            let req = req_builder.body(Empty::default())?;
-
-            let res = client
-                .request(req)
-                .await
-                .with_context(|| format!("Could not fetch from sparse registry: {}", url))?;
-
-            if res.status().as_u16() == 404 {
-                return Ok(false);
-            }
-
-            if res.status().as_u16() >= 400 {
-                anyhow::bail!(
-                    "Failed to fetch crate index for {}: HTTP {}",
-                    name,
-                    res.status()
-                );
-            }
-
-            let body = res
-                .into_body()
-                .collect()
-                .await
-                .context("Could not get body from sparse registry")?
-                .to_bytes();
-
-            let body_str = String::from_utf8_lossy(&body);
-
-            for line in body_str.lines() {
-                let pkg_version: IndexPackageVersion = serde_json::from_str(line)
-                    .with_context(|| format!("Failed to parse JSON line for {}", name))?;
-
-                if pkg_version.version == version && !pkg_version.yanked {
-                    return Ok(true);
+            let mut last_err = None;
+            for attempt in 1..=3u32 {
+                // Rebuild the request on each attempt — hyper consumes it on send.
+                let mut req_builder = Request::builder().method(Method::GET).uri(url.clone());
+                if let Some(token) = &registry.token {
+                    req_builder = req_builder.header("Authorization", token);
                 }
-            }
+                if let Some(user_agent) = &registry.user_agent {
+                    req_builder = req_builder.header("User-Agent", user_agent);
+                }
+                let req = req_builder.body(Empty::default())?;
 
-            return Ok(false);
-        }
+                match client.request(req).await {
+                    Ok(res) => {
+                        if res.status().as_u16() == 404 {
+                            return Ok(false);
+                        }
 
-        // We need an url
-        if let Some(crate_url) = &registry.crate_url {
-            let url: Uri = format!("{crate_url}{name}").parse()?;
+                        if res.status().as_u16() >= 400 {
+                            anyhow::bail!(
+                                "Failed to fetch crate index for {}: HTTP {}",
+                                name,
+                                res.status()
+                            );
+                        }
 
-            let user_agent = registry
-                .user_agent
-                .clone()
-                .unwrap_or_else(|| "fslabsci".to_string());
+                        let body = res
+                            .into_body()
+                            .collect()
+                            .await
+                            .context("Could not get body from sparse registry")?
+                            .to_bytes();
 
-            let Some(token) = registry.token.clone() else {
-                return Err(anyhow::anyhow!(
-                    "looking registry information without setting token: {}",
-                    &registry_name
-                ));
-            };
+                        let body_str = String::from_utf8_lossy(&body);
 
-            let req = Request::builder()
-                .method(Method::GET)
-                .uri(url.clone())
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .header("Authorization", token)
-                .header("User-Agent", user_agent.clone())
-                .body(Empty::default())?;
+                        for line in body_str.lines() {
+                            let pkg_version: IndexPackageVersion = serde_json::from_str(line)
+                                .with_context(|| {
+                                    format!("Failed to parse JSON line for {}", name)
+                                })?;
 
-            let res = self
-                .client
-                .clone()
-                .context("unitialized http client")?
-                .request(req)
-                .await
-                .with_context(|| "Could not fetch from the crates registry")?;
-
-            if res.status().as_u16() == 404 {
-                // New crates
-                return Ok(false);
-            }
-            if res.status().as_u16() >= 400 {
-                anyhow::bail!(
-                    "Something went wrong while getting cargo {} api data",
-                    registry_name
-                );
-            }
-
-            let body = res
-                .into_body()
-                .collect()
-                .await
-                .with_context(|| "Could not get body from the npm registry")?
-                .to_bytes();
-
-            let body_str = String::from_utf8_lossy(&body);
-            let package: Option<CargoPackage> =
-                match serde_json::from_str::<CargoSearchResult>(body_str.as_ref()) {
-                    Ok(search_result) => match (search_result.crates, search_result.single_crate) {
-                        (Some(crates), None) => crates.into_iter().find(|c| c.name == name),
-                        (_, Some(single_crate)) => {
-                            if let Some(versions) = search_result.versions {
-                                Some(CargoPackage {
-                                    name: single_crate.name,
-                                    versions,
-                                })
-                            } else {
-                                None
+                            if pkg_version.version == version && !pkg_version.yanked {
+                                return Ok(true);
                             }
                         }
-                        _ => None,
-                    },
-                    Err(e) => {
-                        warn!(
-                            crate_name = %name,
-                            url = %url,
-                            registry = %registry_name,
-                            error = %e,
-                            "failed to parse JSON response from crate registry"
-                        );
-                        None
-                    }
-                };
 
-            if let Some(package) = package {
-                for package_version in package.versions {
-                    if package_version.version == version {
-                        return Ok(true);
+                        return Ok(false);
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        if attempt < 3 {
+                            tracing::warn!(
+                                crate_name = %name,
+                                attempt = attempt,
+                                error = %last_err.as_ref().unwrap(),
+                                "sparse registry request failed, retrying"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(attempt as u64))
+                                .await;
+                        }
                     }
                 }
             }
-        } else {
+
             return Err(anyhow::anyhow!(
-                "no api url setup for registry: {}",
-                registry_name,
-            ));
+                "Could not fetch from sparse registry after 3 attempts: {}",
+                url
+            ))
+            .with_context(|| {
+                format!(
+                    "last error: {}",
+                    last_err.map(|e| e.to_string()).unwrap_or_default()
+                )
+            });
         }
+
         Ok(false)
     }
 
@@ -1413,11 +1320,11 @@ dependencies = [
         let mut cargo = Cargo::new(&HashSet::new(), false).unwrap();
         let crates_io = CargoRegistry::new(
             "crates.io".to_string(),
+            Some("sparse+https://index.crates.io/".to_string()),
             None,
             None,
-            Some("https://crates.io/api/v1/crates/".to_string()),
-            Some("some".to_string()),
-            Some("fslabscli".to_string()),
+            None,
+            None,
             false,
         )
         .unwrap();
@@ -1440,11 +1347,11 @@ dependencies = [
         let mut cargo = Cargo::new(&HashSet::new(), false).unwrap();
         let crates_io = CargoRegistry::new(
             "crates.io".to_string(),
+            Some("sparse+https://index.crates.io/".to_string()),
             None,
             None,
-            Some("https://crates.io/api/v1/crates/".to_string()),
-            Some("some".to_string()),
-            Some("fslabscli".to_string()),
+            None,
+            None,
             false,
         )
         .unwrap();
