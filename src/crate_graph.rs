@@ -507,7 +507,7 @@ impl DependencyGraph {
                             deps.push(dep);
                             reverse_deps.push(node.id.clone());
                         } else if is_accepted_dep && !me.id_to_path.contains_key(dep_id) {
-                            tracing::trace!(
+                            tracing::debug!(
                                 source_id = %node.id,
                                 dep_id = %dep_id,
                                 dep_name = %node_dep.name,

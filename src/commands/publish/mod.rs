@@ -1223,7 +1223,48 @@ async fn do_publish_package(params: DoPublishParams) -> PublishResult {
                     "{}\nCreating tag {} at {}",
                     result.git_tag.stdout, tag, head
                 );
-                repo.create_ref(&Reference::Tag(tag), head).await?;
+                match repo
+                    .create_ref(&Reference::Tag(tag.clone()), head.clone())
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(create_err) => {
+                        // Tag may already exist — check the existing ref and reconcile.
+                        match repo.get_ref(&Reference::Tag(tag.clone())).await {
+                            Ok(existing_ref) => {
+                                let existing_sha = match &existing_ref.object {
+                                    octocrab::models::repos::Object::Commit { sha, .. } => {
+                                        sha.clone()
+                                    }
+                                    octocrab::models::repos::Object::Tag { sha, .. } => sha.clone(),
+                                    _ => {
+                                        return Err(anyhow::anyhow!(
+                                            "Unexpected ref object type for tag {}",
+                                            tag
+                                        ));
+                                    }
+                                };
+                                if existing_sha == head {
+                                    result.git_tag.stdout = format!(
+                                        "{}\nTag {} already exists at {}, skipping",
+                                        result.git_tag.stdout, tag, head
+                                    );
+                                } else {
+                                    result.git_tag.stdout = format!(
+                                        "{}\nTag {} already exists at {}, updating to {}",
+                                        result.git_tag.stdout, tag, existing_sha, head
+                                    );
+                                    repo.delete_ref(&Reference::Tag(tag.clone())).await?;
+                                    repo.create_ref(&Reference::Tag(tag), head).await?;
+                                }
+                            }
+                            Err(_) => {
+                                // The get_ref also failed; surface the original create error.
+                                return Err(create_err.into());
+                            }
+                        }
+                    }
+                }
             } else {
                 tracing::debug!("Github credentials not set, not doing anything");
             }
