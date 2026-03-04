@@ -21,6 +21,7 @@ use std::{
 use temp_dir::TempDir;
 use tokio::runtime::Handle;
 use toml_edit::{DocumentMut, Table, table, value};
+use tracing::warn;
 use walkdir::WalkDir;
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
@@ -623,7 +624,13 @@ impl CrateChecker for Cargo {
                         _ => None,
                     },
                     Err(e) => {
-                        println!("Got error: {e}");
+                        warn!(
+                            crate_name = %name,
+                            url = %url,
+                            registry = %registry_name,
+                            error = %e,
+                            "failed to parse JSON response from crate registry"
+                        );
                         None
                     }
                 };
