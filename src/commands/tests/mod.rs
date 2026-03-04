@@ -91,7 +91,6 @@ async fn has_cargo_nextest() -> bool {
     }
 }
 
-
 #[derive(Debug, serde::Deserialize)]
 struct JUnitTestSuites {
     #[serde(rename = "testsuite", default)]
