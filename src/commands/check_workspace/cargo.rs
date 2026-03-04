@@ -64,7 +64,7 @@ impl PackageMetadataFslabsCiPublishCargo {
                 {
                     Ok(crate_exists) => !crate_exists,
                     Err(e) => {
-                        tracing::error!("Could not check if crates already exists: {}", e);
+                        tracing::error!("Could not check if crates already exists: {:#}", e);
                         false
                     }
                 }

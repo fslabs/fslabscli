@@ -383,6 +383,11 @@ impl DependencyGraph {
             // Create the 1:1 bidirectional map between path and package ID.
             for p in w.metadata.workspace_packages() {
                 let p_dir_path = package_path(repo_root, p).into_owned();
+                tracing::debug!(
+                    package_id = %p.id,
+                    path = %p_dir_path.display(),
+                    "registering package"
+                );
                 me.path_to_id.insert(p_dir_path.clone(), p.id.clone());
                 me.id_to_path.insert(p.id.clone(), p_dir_path);
                 me.id_to_package.insert(p.id.clone(), p.clone());
@@ -401,7 +406,12 @@ impl DependencyGraph {
             };
             let resolve = metadata_for_resolve.resolve.as_ref().unwrap();
             for node in &resolve.nodes {
-                if me.id_to_path.contains_key(&node.id) {
+                if !me.id_to_path.contains_key(&node.id) {
+                    tracing::debug!(
+                        node_id = %node.id,
+                        "skipping resolve node: not a registered workspace package"
+                    );
+                } else if me.id_to_path.contains_key(&node.id) {
                     let self_package = me.id_to_package.get(&node.id);
                     let deps = me.dependencies.get_mut(&node.id).unwrap();
                     for node_dep in &node.deps {
@@ -451,6 +461,12 @@ impl DependencyGraph {
                             None => true,
                         };
                         if is_accepted_dep && me.id_to_path.contains_key(dep_id) {
+                            tracing::debug!(
+                                source_id = %node.id,
+                                dep_id = %dep_id,
+                                dep_name = %node_dep.name,
+                                "adding dependency edge"
+                            );
                             let reverse_deps = me.reverse_dependencies.get_mut(dep_id).unwrap();
                             let dep = Dependency {
                                 package_id: dep_id.clone(),
@@ -458,11 +474,21 @@ impl DependencyGraph {
                             };
                             deps.push(dep);
                             reverse_deps.push(node.id.clone());
+                        } else if is_accepted_dep && !me.id_to_path.contains_key(dep_id) {
+                            tracing::warn!(
+                                source_id = %node.id,
+                                dep_id = %dep_id,
+                                dep_name = %node_dep.name,
+                                "dropping dependency edge: dep_id not found in registered workspace packages"
+                            );
                         }
                     }
                 }
             }
         }
+
+        let total_edges: usize = me.dependencies.values().map(|deps| deps.len()).sum();
+        tracing::debug!(total_edges, "dependency graph construction complete");
 
         me
     }
