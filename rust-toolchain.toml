@@ -1,4 +1,4 @@
 [toolchain]
 profile = "default"
-channel = "1.89"
+channel = "1.93"
 targets = ["aarch64-apple-darwin", "wasm32-unknown-unknown" ]

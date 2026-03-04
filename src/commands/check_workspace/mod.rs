@@ -25,7 +25,7 @@ use strum_macros::EnumString;
 
 use crate::cli_args::{DiffOptions, DiffStrategy};
 use crate::commands::check_workspace::binary::BinaryStore;
-use crate::crate_graph::CrateGraph;
+use crate::crate_graph::{CrateGraph, FeatureResolution};
 use crate::test_args::TestArgs;
 use crate::utils::cargo::CrateChecker;
 use crate::utils::docker::{Docker, RealHttpClient, RealOciClient};
@@ -888,6 +888,7 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
             &self.repo_root,
             self.common_options.cargo_main_registry.clone(),
             limit_dependency_kind,
+            FeatureResolution::DualGraph,
         )?;
 
         let mut packages: HashMap<PackageId, Result> = HashMap::new();
@@ -1248,7 +1249,7 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
             tracing::info!("Changed packages: {changed_package_paths:#?}");
             // Any packages that transitively depend on changed packages are also considered "changed".
             let changed_closure = crates
-                .dependency_graph()
+                .default_dependency_graph()
                 .reverse_closure(changed_package_paths.iter().map(AsRef::as_ref));
             tracing::info!("Changed closure: {changed_closure:#?}");
 

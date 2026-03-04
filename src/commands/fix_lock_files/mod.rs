@@ -1,5 +1,7 @@
 use crate::{
-    PackageRelatedOptions, PrettyPrintable, crate_graph::CrateGraph, script::CommandOutput,
+    PackageRelatedOptions, PrettyPrintable,
+    crate_graph::{CrateGraph, FeatureResolution},
+    script::CommandOutput,
 };
 use clap::Parser;
 use diffy::create_patch;
@@ -205,7 +207,12 @@ pub fn fix_lock_files(
     } = common_options;
     let Options { check, base_rev } = options;
 
-    let graph = CrateGraph::new(repo_root, cargo_main_registry.clone(), None)?;
+    let graph = CrateGraph::new(
+        repo_root,
+        cargo_main_registry.clone(),
+        None,
+        FeatureResolution::AllFeaturesOnly,
+    )?;
     let check_workspaces: Vec<_> = graph
         .workspaces()
         .iter()
@@ -419,7 +426,7 @@ version = "0.2.0"
     #[tokio::test]
     async fn test_fix_lockfile_updates_in_complex_ws() {
         let ws = create_complex_workspace(true);
-        let graph = CrateGraph::new(&ws, "", None).unwrap();
+        let graph = CrateGraph::new(&ws, "", None, FeatureResolution::AllFeaturesOnly).unwrap();
 
         // Remove lock files created from running cargo-metadata.
         for workspace in graph.workspaces() {
