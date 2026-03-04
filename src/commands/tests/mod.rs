@@ -91,43 +91,6 @@ async fn has_cargo_nextest() -> bool {
     }
 }
 
-/// Count the number of test cases using `cargo nextest list`
-async fn count_nextest_tests(package_path: &PathBuf) -> usize {
-    use serde::Deserialize;
-
-    #[derive(Debug, Deserialize)]
-    struct NextestList {
-        #[serde(rename = "test-count")]
-        test_count: usize,
-    }
-
-    let output = tokio::process::Command::new("cargo")
-        .arg("nextest")
-        .arg("list")
-        .arg("--message-format")
-        .arg("json")
-        .current_dir(package_path)
-        .output()
-        .await;
-
-    let Ok(output) = output else {
-        return 0;
-    };
-
-    if !output.status.success() {
-        return 0;
-    }
-
-    let Ok(json_str) = String::from_utf8(output.stdout) else {
-        return 0;
-    };
-
-    // Parse the JSON output
-    match serde_json::from_str::<NextestList>(&json_str) {
-        Ok(list) => list.test_count,
-        Err(_) => 0,
-    }
-}
 
 #[derive(Debug, serde::Deserialize)]
 struct JUnitTestSuites {
@@ -770,13 +733,7 @@ async fn do_test_on_package(
     })
     .collect();
 
-    // Count nextest subtests if available to adjust total step count
-    let nextest_subtest_count = if use_nextest {
-        count_nextest_tests(&package_path).await
-    } else {
-        0
-    };
-    let test_steps = fslabs_tests.len() + nextest_subtest_count;
+    let test_steps = fslabs_tests.len();
 
     for (mut i, fslabs_test) in fslabs_tests.into_iter().enumerate() {
         i += 1;
