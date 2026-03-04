@@ -228,12 +228,32 @@ impl CrateGraph {
         packages.sort_by_key(|package| package_path(&self.repo_root, package).iter().count());
         packages.reverse();
 
+        // delta_path is always relative to repo_root (from gix tree diff or git diff --name-only)
         let mut record_change = |delta_path: &Path| {
+            // Scope detection for .cargo/config.toml: affects all packages under the
+            // directory containing .cargo/. Matches Cargo's own directory-scoping semantics
+            // where config lookup ascends the tree but doesn't descend into siblings.
+            // Path::ends_with is component-based, so ".cargo/config.toml" matches the
+            // last two path components, not a string suffix.
+            let cargo_config_scope = if delta_path.ends_with(".cargo/config.toml") {
+                delta_path.parent().and_then(|p| p.parent())
+            } else {
+                None
+            };
+
             for package in &packages {
                 let pkg_path = package_path(&self.repo_root, package).into_owned();
                 let is_repo_root = pkg_path == Path::new(".");
                 if delta_path.ends_with("rust-toolchain.toml") {
                     changed.push(pkg_path.clone());
+                    continue;
+                }
+                if let Some(scope) = cargo_config_scope {
+                    // Empty scope means root-level .cargo/config.toml → all packages affected.
+                    if scope.as_os_str().is_empty() || pkg_path.starts_with(scope) {
+                        changed.push(pkg_path.clone());
+                    }
+                    // continue (not return): a config.toml may affect multiple packages
                     continue;
                 }
                 if is_repo_root || delta_path.starts_with(&pkg_path) {

@@ -1427,6 +1427,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cargo_config_trigger_scoped_test() {
+        init_crypto_provider();
+        let ws = create_complex_workspace(true);
+
+        // Add a .cargo/config.toml inside workspace_a (scoped, not at repo root)
+        modify_file(
+            &ws,
+            "workspace_a/.cargo/config.toml",
+            "[build]\nrustflags = [\"-C\", \"opt-level=2\"]",
+        );
+        stage_file(&ws, "workspace_a/.cargo/config.toml");
+        commit_repo(&ws, "added cargo config to workspace_a");
+
+        let common_options = PackageRelatedOptions::default();
+        let diff = DiffOptions {
+            strategy: Some(DiffStrategy::LocalChanges),
+            ..Default::default()
+        };
+        let check_workspace_options = Options {
+            diff,
+            check_changed: true,
+            ..Default::default()
+        };
+        let results =
+            check_workspace::<Cargo>(&common_options, &check_workspace_options, ws.clone())
+                .await
+                .unwrap();
+
+        // Only packages within workspace_a scope should be directly changed
+        let expected_changed: HashMap<String, bool> = HashMap::from([
+            ("workspace_a".to_string(), true),
+            ("workspace_a__crates_a".to_string(), true),
+            ("workspace_a__crates_b".to_string(), true),
+            ("workspace_a__crates_c".to_string(), true),
+            ("workspace_d".to_string(), false),
+            ("workspace_d__crates_e".to_string(), false),
+            ("workspace_d__crates_f".to_string(), false),
+            ("crates_g".to_string(), false),
+        ]);
+        let actual_changed: HashMap<String, bool> = results
+            .members
+            .values()
+            .map(|p| (p.package.clone(), p.changed))
+            .collect();
+        assert_eq!(expected_changed, actual_changed);
+
+        // Packages outside the scope that transitively depend on changed packages
+        // should have dependencies_changed set, not changed
+        let expected_deps_changed: HashMap<String, bool> = HashMap::from([
+            ("workspace_a".to_string(), false),
+            ("workspace_a__crates_a".to_string(), false),
+            ("workspace_a__crates_b".to_string(), false),
+            ("workspace_a__crates_c".to_string(), false),
+            ("workspace_d".to_string(), false),
+            ("workspace_d__crates_e".to_string(), true),
+            ("workspace_d__crates_f".to_string(), false),
+            ("crates_g".to_string(), true),
+        ]);
+        let actual_deps_changed: HashMap<String, bool> = results
+            .members
+            .values()
+            .map(|p| (p.package.clone(), p.dependencies_changed))
+            .collect();
+        assert_eq!(expected_deps_changed, actual_deps_changed);
+    }
+
+    #[tokio::test]
+    async fn test_cargo_config_at_root_triggers_full_test() {
+        init_crypto_provider();
+        let ws = create_complex_workspace(true);
+        // Modify the root-level .cargo/config.toml, preserving the existing registry config
+        modify_file(
+            &ws,
+            ".cargo/config.toml",
+            "[registries.fake-registry]\nindex = \"ssh://git@ssh.shipyard.rs/fake-registry/crate-index.git\"\n\n[build]\nrustflags = [\"-C\", \"opt-level=2\"]",
+        );
+        stage_file(&ws, ".cargo/config.toml");
+        commit_repo(&ws, "modified root cargo config");
+        let common_options = PackageRelatedOptions::default();
+        let diff = DiffOptions {
+            strategy: Some(DiffStrategy::LocalChanges),
+            ..Default::default()
+        };
+        let check_workspace_options = Options {
+            diff,
+            check_changed: true,
+            ..Default::default()
+        };
+        let results =
+            check_workspace::<Cargo>(&common_options, &check_workspace_options, ws.clone())
+                .await
+                .unwrap();
+        for (_, member) in results.members {
+            assert!(member.changed, "expected {} to be changed", member.package);
+        }
+    }
+
+    #[tokio::test]
     async fn test_whitelist_is_respected_for_tests() {
         init_crypto_provider();
         // First we test without whitelist
