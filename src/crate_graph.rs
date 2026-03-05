@@ -1066,6 +1066,202 @@ crates_g = {{ version = "0.1.0", path = "../../../crates_g", registry = "fake-re
         assert!(graph.is_err());
     }
 
+    // --- Dev-dependency handling tests ---
+    //
+    // These tests pin down the behaviour of dev-dep edges in the graph so the
+    // team stops flip-flopping on whether dev deps belong in the publish DAG.
+    // The authoritative answer is:
+    //   • Path-only dev deps  → excluded from publish ordering (cycle-safe).
+    //   • Registry dev deps   → included in publish ordering (cargo publish needs them).
+
+    #[test]
+    /// A local dev-dep edge must appear in the graph when dep_kind is None, and
+    /// the stored DependencyInstance must record kind=Development and is_local=true.
+    fn test_dev_dep_included_when_no_kind_filter() {
+        let repo = create_complex_workspace(true);
+
+        // Add workspace_a/crates_b as a dev-dep of workspace_a/crates_c (path-only,
+        // no version pin → is_local == true).
+        Command::new("cargo")
+            .args([
+                "add",
+                "--offline",
+                "--dev",
+                "--path",
+                "../crates_b",
+                "workspace_a__crates_b",
+            ])
+            .current_dir(repo.join("workspace_a/crates/crates_c"))
+            .output()
+            .expect("Failed to add dev dep");
+
+        commit_all_changes(&repo, "Add path dev-dep crates_c -> crates_b");
+
+        let graph = CrateGraph::new(&repo, "", None, FeatureResolution::AllFeaturesOnly).unwrap();
+        let dep_graph = graph.dependency_graph();
+
+        // Locate crates_c and crates_b by path.
+        let crates_c_path = Path::new("workspace_a").join("crates").join("crates_c");
+        let crates_b_path = Path::new("workspace_a").join("crates").join("crates_b");
+
+        let crates_c_id = &dep_graph.path_to_id[&crates_c_path];
+        let crates_b_id = &dep_graph.path_to_id[&crates_b_path];
+
+        let crates_c_deps = dep_graph.dependencies.get(crates_c_id).unwrap();
+        let dev_dep = crates_c_deps
+            .iter()
+            .find(|d| &d.package_id == crates_b_id)
+            .expect("dev-dep edge from crates_c to crates_b must exist when dep_kind=None");
+
+        // The instance must be flagged as Development + local.
+        assert!(
+            dev_dep
+                .instances
+                .iter()
+                .any(|i| i.kind == DependencyKind::Development && i.is_local),
+            "Expected a Development+local instance, got: {:?}",
+            dev_dep.instances
+        );
+    }
+
+    #[test]
+    /// When dep_kind=Some(Normal), dev-dep edges must be absent from the graph.
+    /// This mirrors how `cargo publish` ordering used to be built — but note that
+    /// excluding dev deps here can cause publish failures for registry dev deps.
+    fn test_dev_dep_excluded_when_normal_kind_filter() {
+        let repo = create_complex_workspace(true);
+
+        // Same path dev-dep as the test above.
+        Command::new("cargo")
+            .args([
+                "add",
+                "--offline",
+                "--dev",
+                "--path",
+                "../crates_b",
+                "workspace_a__crates_b",
+            ])
+            .current_dir(repo.join("workspace_a/crates/crates_c"))
+            .output()
+            .expect("Failed to add dev dep");
+
+        commit_all_changes(&repo, "Add path dev-dep crates_c -> crates_b");
+
+        let graph = CrateGraph::new(
+            &repo,
+            "",
+            Some(DependencyKind::Normal),
+            FeatureResolution::AllFeaturesOnly,
+        )
+        .unwrap();
+        let dep_graph = graph.dependency_graph();
+
+        let crates_c_path = Path::new("workspace_a").join("crates").join("crates_c");
+        let crates_b_path = Path::new("workspace_a").join("crates").join("crates_b");
+
+        let crates_c_id = &dep_graph.path_to_id[&crates_c_path];
+        let crates_b_id = &dep_graph.path_to_id[&crates_b_path];
+
+        let crates_c_deps = dep_graph.dependencies.get(crates_c_id).unwrap();
+        let dev_dep_edge = crates_c_deps.iter().find(|d| &d.package_id == crates_b_id);
+
+        assert!(
+            dev_dep_edge.is_none(),
+            "Dev-dep edge must be absent when dep_kind=Some(Normal), got: {:?}",
+            dev_dep_edge
+        );
+    }
+
+    #[test]
+    /// A dev-dep that specifies a registry (not path-only) must be recorded with
+    /// is_local == false. Registry dev-deps must be published before the dependant,
+    /// so they must survive the publish-ordering filter.
+    fn test_registry_dev_dep_not_local() {
+        let repo = create_complex_workspace(true);
+
+        // Write a dev-dependency with both path + registry directly so that the
+        // registry field is set, making is_local == false.
+        let mut crates_c_cargo_toml = OpenOptions::new()
+            .append(true)
+            .open(repo.join("workspace_a/crates/crates_c/Cargo.toml"))
+            .unwrap();
+
+        writeln!(
+            crates_c_cargo_toml,
+            r#"[dev-dependencies]
+workspace_a__crates_b = {{ version = "0.1.0", path = "../crates_b", registry = "fake-registry" }}"#
+        )
+        .unwrap();
+
+        commit_all_changes(&repo, "Add registry dev-dep crates_c -> crates_b");
+
+        let graph = CrateGraph::new(&repo, "", None, FeatureResolution::AllFeaturesOnly).unwrap();
+        let dep_graph = graph.dependency_graph();
+
+        let crates_c_path = Path::new("workspace_a").join("crates").join("crates_c");
+        let crates_b_path = Path::new("workspace_a").join("crates").join("crates_b");
+
+        let crates_c_id = &dep_graph.path_to_id[&crates_c_path];
+        let crates_b_id = &dep_graph.path_to_id[&crates_b_path];
+
+        let crates_c_deps = dep_graph.dependencies.get(crates_c_id).unwrap();
+        let dep = crates_c_deps
+            .iter()
+            .find(|d| &d.package_id == crates_b_id)
+            .expect("registry dev-dep edge from crates_c to crates_b must exist");
+
+        assert!(
+            dep.instances
+                .iter()
+                .any(|i| i.kind == DependencyKind::Development && !i.is_local),
+            "Expected a Development+non-local instance for a registry dev-dep, got: {:?}",
+            dep.instances
+        );
+    }
+
+    #[test]
+    /// reverse_closure must walk through dev-dep edges when the graph was built
+    /// with dep_kind=None. This is critical: if crate A dev-depends on crate B,
+    /// a change to B should mark A as needing a re-test.
+    fn test_reverse_closure_includes_dev_dep_dependents() {
+        let repo = create_complex_workspace(true);
+
+        // workspace_a/crates_c dev-depends on workspace_a/crates_b (path-only).
+        Command::new("cargo")
+            .args([
+                "add",
+                "--offline",
+                "--dev",
+                "--path",
+                "../crates_b",
+                "workspace_a__crates_b",
+            ])
+            .current_dir(repo.join("workspace_a/crates/crates_c"))
+            .output()
+            .expect("Failed to add dev dep");
+
+        commit_all_changes(&repo, "Add path dev-dep crates_c -> crates_b");
+
+        // Build graph with all dep kinds so the dev-dep edge is present.
+        let graph = CrateGraph::new(&repo, "", None, FeatureResolution::AllFeaturesOnly).unwrap();
+        let dep_graph = graph.dependency_graph();
+
+        let crates_b_path = Path::new("workspace_a").join("crates").join("crates_b");
+        let crates_c_path = Path::new("workspace_a").join("crates").join("crates_c");
+
+        // A change to crates_b must propagate to crates_c via the dev-dep edge.
+        let closure = dep_graph.reverse_closure([crates_b_path.as_path()]);
+
+        assert!(
+            closure.contains(&crates_c_path),
+            "reverse_closure of crates_b must include crates_c (dev-dep dependent), got: {closure:?}"
+        );
+        assert!(
+            closure.contains(&crates_b_path),
+            "reverse_closure must always include the seed package itself"
+        );
+    }
+
     #[test]
     fn test_dual_graph_narrows_reverse_closure() {
         // Create a workspace with two crates where crate_a optionally depends on crate_b.
