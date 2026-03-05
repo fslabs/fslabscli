@@ -832,6 +832,73 @@ impl PrettyPrintable for Results {
     }
 }
 
+/// Finds dev-dependencies that reference a workspace crate via `path` but lack a `registry`
+/// field. Without `registry`, `cargo publish` resolves them from crates.io instead of the
+/// private registry, causing publish failures.
+fn find_dev_dep_missing_registry_warnings(
+    workspaces: &[crate::crate_graph::Workspace],
+    dep_to_id: &HashMap<String, PackageId>,
+    packages: &HashMap<PackageId, Result>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    for workspace in workspaces {
+        for ws_package in workspace.metadata.workspace_packages() {
+            for dep in &ws_package.dependencies {
+                if dep.kind != DependencyKind::Development {
+                    continue;
+                }
+                if dep.path.is_none() {
+                    continue;
+                }
+                if dep.registry.is_some() {
+                    continue;
+                }
+
+                let Some(target_id) = dep_to_id.get(&dep.name) else {
+                    continue;
+                };
+                let Some(target_result) = packages.get(target_id) else {
+                    continue;
+                };
+
+                let private_registries: Vec<&String> = target_result
+                    .publish_detail
+                    .cargo
+                    .registries
+                    .as_ref()
+                    .map(|regs| {
+                        regs.iter()
+                            .filter(|r| *r != "crates-io")
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                if private_registries.is_empty() {
+                    continue;
+                }
+
+                let registries_display = private_registries
+                    .iter()
+                    .map(|r| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let first_registry = private_registries[0];
+
+                warnings.push(format!(
+                    "Dev-dependency '{}' in '{}' is a workspace crate published to \
+                     registry '{}' but has no `registry` field in Cargo.toml. \
+                     `cargo publish` will look for it on crates.io and fail. \
+                     Add `registry = \"{}\"` to the dependency.",
+                    dep.name, ws_package.name, registries_display, first_registry
+                ));
+            }
+        }
+    }
+
+    warnings
+}
+
 pub struct WorkspaceChecker<'a, C> {
     common_options: &'a PackageRelatedOptions,
     options: &'a Options,
@@ -1072,6 +1139,15 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
             }
         }
         drop(_backfeed_span);
+
+        // Warn about dev-dependencies missing registry field.
+        // Placed after the backfeed loop because backfeed propagates registries
+        // to transitive dependencies — calling earlier would miss some.
+        let dev_dep_warnings =
+            find_dev_dep_missing_registry_warnings(crates.workspaces(), &dep_to_id, &packages);
+        for warning in &dev_dep_warnings {
+            tracing::warn!("{}", warning);
+        }
 
         // Check Publich status
         if self.common_options.progress {
@@ -1351,10 +1427,14 @@ mod tests {
         cli_args::{DiffOptions, DiffStrategy},
         commands::check_workspace::{
             Options, Result as Package, WorkspaceChecker, check_workspace,
+            find_dev_dep_missing_registry_warnings,
         },
+        crate_graph::{CrateGraph, FeatureResolution},
         utils::{
             cargo::{Cargo, tests::MockCargo},
-            test::{commit_repo, create_complex_workspace, modify_file, stage_file},
+            test::{
+                commit_all_changes, commit_repo, create_complex_workspace, modify_file, stage_file,
+            },
         },
     };
 
@@ -1735,5 +1815,198 @@ mod tests {
             .map(|p| (p.package.clone(), p.publish))
             .collect();
         assert_eq!(expected_publish_status, actual_publish_status);
+    }
+
+    /// Builds the dep_to_id and packages maps from a CrateGraph, mirroring
+    /// the logic in `WorkspaceChecker::check_workspace`.
+    fn build_dep_maps(
+        crates: &CrateGraph,
+        repo_root: &std::path::Path,
+    ) -> (
+        HashMap<String, cargo_metadata::PackageId>,
+        HashMap<cargo_metadata::PackageId, Package>,
+    ) {
+        let mut dep_to_id: HashMap<String, cargo_metadata::PackageId> = HashMap::new();
+        let mut packages: HashMap<cargo_metadata::PackageId, Package> = HashMap::new();
+
+        for workspace in crates.workspaces() {
+            let resolve = workspace.metadata.resolve.as_ref().unwrap();
+            for node in &resolve.nodes {
+                for node_dep in &node.deps {
+                    dep_to_id.insert(node_dep.name.to_string(), node_dep.pkg.clone());
+                }
+            }
+            for package in workspace.metadata.workspace_packages() {
+                dep_to_id.insert(package.name.to_string(), package.id.clone());
+            }
+            for package in workspace.metadata.workspace_packages() {
+                match Package::new(
+                    workspace.path.to_string_lossy().into(),
+                    package.clone(),
+                    repo_root.to_path_buf(),
+                    false,
+                    &dep_to_id,
+                ) {
+                    Ok(pkg) => {
+                        packages.insert(pkg.package_id.clone().unwrap(), pkg);
+                    }
+                    Err(e) => {
+                        panic!("Failed to construct package in test helper: {e}");
+                    }
+                }
+            }
+        }
+
+        (dep_to_id, packages)
+    }
+
+    #[test]
+    fn test_dev_dep_missing_registry_detected() {
+        // Arrange: create workspace and add a dev-dep WITHOUT --registry
+        init_crypto_provider();
+        let ws = create_complex_workspace(true);
+
+        let output = std::process::Command::new("cargo")
+            .args([
+                "add",
+                "--dev",
+                "--offline",
+                "--path",
+                "../../../crates_g",
+                "crates_g",
+            ])
+            .current_dir(ws.join("workspace_a").join("crates").join("crates_c"))
+            .output()
+            .expect("Failed to add crates_g as dev-dep");
+        assert!(
+            output.status.success(),
+            "cargo add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        commit_all_changes(&ws, "Add dev-dep without registry");
+
+        let crates = CrateGraph::new(&ws, "", None, FeatureResolution::DualGraph).unwrap();
+        let (dep_to_id, packages) = build_dep_maps(&crates, &ws);
+
+        // Act
+        let warnings =
+            find_dev_dep_missing_registry_warnings(crates.workspaces(), &dep_to_id, &packages);
+
+        // Assert: should warn about crates_g in workspace_a__crates_c
+        assert!(
+            !warnings.is_empty(),
+            "Expected at least one warning for dev-dep missing registry"
+        );
+        assert_eq!(
+            warnings.len(),
+            1,
+            "Expected exactly one warning, got: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("crates_g") && w.contains("workspace_a__crates_c")),
+            "Expected warning mentioning crates_g and workspace_a__crates_c, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_dev_dep_with_registry_no_warning() {
+        // Arrange: create workspace and add a dev-dep, then manually set registry.
+        // `cargo add --registry` does not write a `registry` field for path deps,
+        // so we patch Cargo.toml directly (which is what the function detects).
+        init_crypto_provider();
+        let ws = create_complex_workspace(true);
+
+        let output = std::process::Command::new("cargo")
+            .args([
+                "add",
+                "--dev",
+                "--offline",
+                "--path",
+                "../../../crates_g",
+                "crates_g",
+            ])
+            .current_dir(ws.join("workspace_a").join("crates").join("crates_c"))
+            .output()
+            .expect("Failed to add crates_g as dev-dep");
+        assert!(
+            output.status.success(),
+            "cargo add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Patch the Cargo.toml to include `registry = "fake-registry"` on the dev-dep.
+        let cargo_toml_path = ws
+            .join("workspace_a")
+            .join("crates")
+            .join("crates_c")
+            .join("Cargo.toml");
+        let content = std::fs::read_to_string(&cargo_toml_path).unwrap();
+        let patched = content.replace(
+            "crates_g = { path = \"../../../crates_g\" }",
+            "crates_g = { path = \"../../../crates_g\", registry = \"fake-registry\" }",
+        );
+        assert_ne!(content, patched, "Cargo.toml patch did not match");
+        std::fs::write(&cargo_toml_path, patched).unwrap();
+
+        commit_all_changes(&ws, "Add dev-dep with registry");
+
+        let crates = CrateGraph::new(&ws, "", None, FeatureResolution::DualGraph).unwrap();
+        let (dep_to_id, packages) = build_dep_maps(&crates, &ws);
+
+        // Act
+        let warnings =
+            find_dev_dep_missing_registry_warnings(crates.workspaces(), &dep_to_id, &packages);
+
+        // Assert: no warning should mention crates_g in workspace_a__crates_c
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.contains("crates_g") && w.contains("workspace_a__crates_c")),
+            "Did not expect a warning for dev-dep with registry, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_normal_dep_missing_registry_no_warning() {
+        // Arrange: add crates_g (which has private registries) as a normal dep
+        // of workspace_a__crates_c WITHOUT registry. The function should NOT warn
+        // because it only inspects dev-dependencies.
+        init_crypto_provider();
+        let ws = create_complex_workspace(true);
+
+        let output = std::process::Command::new("cargo")
+            .args([
+                "add",
+                "--offline",
+                "--path",
+                "../../../crates_g",
+                "crates_g",
+            ])
+            .current_dir(ws.join("workspace_a").join("crates").join("crates_c"))
+            .output()
+            .expect("Failed to add crates_g as normal dep");
+        assert!(
+            output.status.success(),
+            "cargo add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        commit_all_changes(&ws, "Add normal dep without registry");
+
+        let crates = CrateGraph::new(&ws, "", None, FeatureResolution::DualGraph).unwrap();
+        let (dep_to_id, packages) = build_dep_maps(&crates, &ws);
+
+        // Act
+        let warnings =
+            find_dev_dep_missing_registry_warnings(crates.workspaces(), &dep_to_id, &packages);
+
+        // Assert: normal deps are not checked, only dev deps
+        assert!(
+            warnings.is_empty(),
+            "Expected no warnings for normal dep missing registry, got: {warnings:?}"
+        );
     }
 }
