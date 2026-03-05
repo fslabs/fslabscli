@@ -1435,6 +1435,15 @@ pub async fn report_publish_to_github(
     Ok(())
 }
 
+/// Returns true if the dependency should be included in publish ordering.
+/// Registry dev deps (is_local=false) are kept because cargo publish verifies them.
+/// Path-only dev deps (is_local=true) are stripped — they can form cycles and aren't on the registry.
+fn is_publish_ordered_dep(dep: &crate::crate_graph::Dependency) -> bool {
+    dep.instances
+        .iter()
+        .any(|k| k.kind != DependencyKind::Development || !k.is_local)
+}
+
 pub async fn publish(
     common_options: &mut PackageRelatedOptions,
     options: &Options,
@@ -1490,11 +1499,19 @@ pub async fn publish(
     }
     common_options.whitelist = whitelist;
 
-    // Check workspace information
+    // Dev dependencies must be included in the dependency graph so publish ordering is
+    // correct. `cargo publish` validates that all declared dependencies exist on the
+    // registry, including dev deps. If crate A is a registry dev-dependency of crate B,
+    // A must be published before B. The publish ordering filter below strips path-only
+    // dev deps (never on a registry) while keeping registry dev deps in the ordering.
+    // Cycle detection in crate_graph.rs skips local dev-only deps to allow valid cycles.
+    //
+    // WARNING: Do not set ignore_dev_dependencies to true — it removes dev deps from
+    // the ordering graph and causes publish failures for registry dev-dependencies.
     let check_workspace_options = CheckWorkspaceOptions::new()
         .with_check_publish(true)
         .with_autopublish_cargo(options.autopublish_cargo)
-        .with_ignore_dev_dependencies(true)
+        .with_ignore_dev_dependencies(false)
         .with_force_publish(options.force_publish);
 
     let results =
@@ -1546,13 +1563,10 @@ pub async fn publish(
             .dependencies
             .get(member_id)
             .map(|deps| {
-                // We should remove the dev and path only dependencies from the tree
+                // Strip path-only dev deps (never on the registry and may form cycles).
+                // Registry dev deps (is_local=false) are retained for correct publish ordering.
                 deps.iter()
-                    .filter(|d| {
-                        d.instances
-                            .iter()
-                            .any(|k| k.kind != DependencyKind::Development || !k.is_local)
-                    })
+                    .filter(|d| is_publish_ordered_dep(d))
                     .cloned()
                     .collect::<Vec<Dependency>>()
             });
@@ -2017,5 +2031,151 @@ mod tests {
             .first_or_octet_stream()
             .to_string();
         assert_eq!(content_type, "application/octet-stream");
+    }
+
+    // --- Publish ordering filter tests ---
+    //
+    // The filter at lines 1540-1545 decides which dependency edges survive into
+    // the publish DAG.  The rule:
+    //
+    //   KEEP  if ANY instance satisfies: kind != Development  OR  !is_local
+    //   STRIP if ALL instances satisfy:  kind == Development  AND  is_local
+    //
+    // Rationale:
+    //   • Path-only dev deps can be circular and do not need to be on the
+    //     registry before the dependant is published.
+    //   • Registry dev deps (is_local = false) MUST be on the registry first,
+    //     so they must be kept in the ordering graph.
+    //   • Normal deps (local or not) must always be ordered first.
+
+    /// Helper: apply the same filter predicate used in the publish ordering.
+    fn apply_publish_filter(
+        deps: &[crate::crate_graph::Dependency],
+    ) -> Vec<crate::crate_graph::Dependency> {
+        deps.iter()
+            .filter(|d| super::is_publish_ordered_dep(d))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    /// A registry dev-dep (is_local=false) must survive the publish filter so
+    /// that it is published before its dependant.
+    fn test_publish_filter_keeps_registry_dev_dep() {
+        use crate::crate_graph::{Dependency, DependencyInstance};
+        use cargo_metadata::{DependencyKind, PackageId};
+
+        // Arrange: dev-dep that lives in a registry, not just by path.
+        let dep = Dependency {
+            package_id: PackageId {
+                repr: "registry-dep 0.1.0".to_string(),
+            },
+            instances: vec![DependencyInstance {
+                kind: DependencyKind::Development,
+                is_local: false,
+            }],
+        };
+
+        // Act
+        let kept = apply_publish_filter(&[dep]);
+
+        // Assert: the dependency is retained because it must be on the registry.
+        assert_eq!(
+            kept.len(),
+            1,
+            "Registry dev-dep must be kept; it must be published before the dependant"
+        );
+    }
+
+    #[test]
+    /// A path-only dev-dep (is_local=true) must be stripped from the publish
+    /// ordering — these deps are path-only, never published, and can form cycles.
+    fn test_publish_filter_strips_local_dev_dep() {
+        use crate::crate_graph::{Dependency, DependencyInstance};
+        use cargo_metadata::{DependencyKind, PackageId};
+
+        // Arrange: dev-dep that is only referenced by local path.
+        let dep = Dependency {
+            package_id: PackageId {
+                repr: "local-dev-dep 0.1.0".to_string(),
+            },
+            instances: vec![DependencyInstance {
+                kind: DependencyKind::Development,
+                is_local: true,
+            }],
+        };
+
+        // Act
+        let kept = apply_publish_filter(&[dep]);
+
+        // Assert: stripped — it would not be on the registry anyway.
+        assert!(
+            kept.is_empty(),
+            "Path-only dev-dep must be stripped from publish ordering"
+        );
+    }
+
+    #[test]
+    /// A dependency that appears as both Normal+local and Development+local must
+    /// be kept: the Normal instance means the dep must be published first.
+    fn test_publish_filter_keeps_mixed_dep() {
+        use crate::crate_graph::{Dependency, DependencyInstance};
+        use cargo_metadata::{DependencyKind, PackageId};
+
+        // Arrange: same crate used as both a normal dep and a dev dep (both local).
+        let dep = Dependency {
+            package_id: PackageId {
+                repr: "mixed-dep 0.1.0".to_string(),
+            },
+            instances: vec![
+                DependencyInstance {
+                    kind: DependencyKind::Normal,
+                    is_local: true,
+                },
+                DependencyInstance {
+                    kind: DependencyKind::Development,
+                    is_local: true,
+                },
+            ],
+        };
+
+        // Act
+        let kept = apply_publish_filter(&[dep]);
+
+        // Assert: kept because the Normal instance requires publish ordering.
+        assert_eq!(
+            kept.len(),
+            1,
+            "Dep with a Normal instance must be kept regardless of dev-dep instances"
+        );
+    }
+
+    #[test]
+    /// A regular local path dependency (Normal+local) must always be kept —
+    /// it must be published before anything that depends on it.
+    fn test_publish_filter_keeps_normal_dep() {
+        use crate::crate_graph::{Dependency, DependencyInstance};
+        use cargo_metadata::{DependencyKind, PackageId};
+
+        // Arrange: ordinary local path dependency.
+        let dep = Dependency {
+            package_id: PackageId {
+                repr: "normal-dep 0.1.0".to_string(),
+            },
+            instances: vec![DependencyInstance {
+                kind: DependencyKind::Normal,
+                is_local: true,
+            }],
+        };
+
+        // Act
+        let kept = apply_publish_filter(&[dep]);
+
+        // Assert: normal deps are never stripped.
+        assert_eq!(
+            kept.len(),
+            1,
+            "Normal dep must always survive the publish filter"
+        );
     }
 }
