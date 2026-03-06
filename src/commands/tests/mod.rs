@@ -931,11 +931,18 @@ async fn run_package_tests(
             }
 
             if let Some(pre_command) = fslabs_test.pre_command {
-                Script::new(&pre_command, true)
+                let pre_output = Script::new(&pre_command, true)
                     .current_dir(&package_path)
                     .envs(&fslabs_test.envs)
                     .execute()
                     .await;
+                if !pre_output.success {
+                    tracing::warn!(
+                        "│ {} │ pre_command failed: {}",
+                        &tc_prefix,
+                        pre_output.stderr.trim_end()
+                    );
+                }
             }
             let test_output = match fslabs_test.id == "cargo_lock" {
                 true => {
@@ -956,11 +963,18 @@ async fn run_package_tests(
                 }
             };
             if let Some(post_command) = fslabs_test.post_command {
-                Script::new(&post_command, true)
+                let post_output = Script::new(&post_command, true)
                     .current_dir(&package_path)
                     .envs(&fslabs_test.envs)
                     .execute()
                     .await;
+                if !post_output.success {
+                    tracing::warn!(
+                        "│ {} │ post_command failed: {}",
+                        &tc_prefix,
+                        post_output.stderr.trim_end()
+                    );
+                }
             }
 
             // Cleanup nextest configuration if this is the cargo_test step and nextest was used
