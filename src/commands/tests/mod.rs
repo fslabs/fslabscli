@@ -20,6 +20,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::Semaphore;
+use tracing::Instrument;
 
 use crate::{
     PackageRelatedOptions, PrettyPrintable,
@@ -227,6 +228,7 @@ fn merge_nextest_junit(
     }
 }
 
+#[tracing::instrument(skip_all, name = "tests", fields(otel.status_code = tracing::field::Empty))]
 pub async fn tests(
     common_options: &PackageRelatedOptions,
     options: &Options,
@@ -398,14 +400,17 @@ pub async fn tests(
             .base_sha
             .clone()
             .unwrap_or_else(|| "origin/main".into());
-        let task_handle = tokio::spawn(do_test_on_package(
-            common_opts,
-            repo_root.clone(),
-            base_revspec,
-            member,
-            metrics.clone(),
-            semaphore.clone(),
-        ));
+        let task_handle = tokio::spawn(
+            do_test_on_package(
+                common_opts,
+                repo_root.clone(),
+                base_revspec,
+                member,
+                metrics.clone(),
+                semaphore.clone(),
+            )
+            .instrument(tracing::Span::current()),
+        );
         handles.push(task_handle);
     }
 
@@ -447,6 +452,7 @@ pub async fn tests(
                 &[KeyValue::new("status", "success")],
             );
             overall_counter.add(1, &[KeyValue::new("success", true)]);
+            tracing::Span::current().record("otel.status_code", "OK");
             Ok(TestResult {})
         }
         true => {
@@ -455,6 +461,7 @@ pub async fn tests(
                 &[KeyValue::new("status", "failed")],
             );
             overall_counter.add(1, &[KeyValue::new("success", false)]);
+            tracing::Span::current().record("otel.status_code", "ERROR");
             Err(anyhow::anyhow!("tests failed"))
         }
     }
@@ -481,6 +488,29 @@ async fn do_test_on_package(
 ) -> (bool, Report) {
     let permit = semaphore.acquire().await;
 
+    let result = run_package_tests(common_options, repo_root, base_revspec, member, metrics).await;
+    drop(permit);
+    result
+}
+
+#[tracing::instrument(
+    skip_all,
+    name = "test_package",
+    fields(
+        otel.name = format!("test_package: {}", member.package),
+        otel.status_code = tracing::field::Empty,
+        workspace = %member.workspace,
+        package = %member.package,
+        version = %member.version,
+    )
+)]
+async fn run_package_tests(
+    common_options: Arc<PackageRelatedOptions>,
+    repo_root: PathBuf,
+    base_revspec: String,
+    member: super::check_workspace::Result,
+    metrics: Metrics,
+) -> (bool, Report) {
     let mut junit_report = ReportBuilder::new().build();
     let mut failed = false;
 
@@ -841,6 +871,13 @@ async fn do_test_on_package(
         if fslabs_test.skip {
             continue;
         }
+        let step_span = tracing::info_span!(
+            "test_step",
+            otel.name = format!("test_step: {}", fslabs_test.command),
+            otel.status_code = tracing::field::Empty,
+            step = %fslabs_test.id,
+        );
+        let _step_entered = step_span.enter();
         let tc_prefix = format!(
             "{package_name:30.30} {i}/{test_steps} │ {:50.50}",
             fslabs_test.command
@@ -932,6 +969,11 @@ async fn do_test_on_package(
                     tracing::debug!("Failed to cleanup .config directory: {}", e);
                 }
             }
+
+            tracing::Span::current().record(
+                "otel.status_code",
+                if test_output.success { "OK" } else { "ERROR" },
+            );
 
             let end_time = OffsetDateTime::now_utc();
             let duration = end_time - start_time;
@@ -1069,7 +1111,6 @@ async fn do_test_on_package(
         .common_member_duration_h
         .record(member_duration.as_seconds_f64(), &attributes);
     metrics.common_member_counter.add(1, &attributes);
-    drop(permit);
-    // drop(package_span);
+    tracing::Span::current().record("otel.status_code", if failed { "ERROR" } else { "OK" });
     (failed, junit_report)
 }

@@ -22,6 +22,7 @@ use crate::commands::summaries::{Options as SummariesOptions, summaries};
 use crate::commands::tests::{Options as TestsOptions, tests};
 use crate::crate_graph::find_git_root;
 
+use opentelemetry::trace::TracerProvider;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_sdk::{
@@ -255,13 +256,17 @@ pub fn setup_logging(verbosity: u8) -> OtelGuard {
         .with_writer(io::stderr)
         .compact();
 
+    let traces_provider = init_traces();
+    let otel_tracer_layer =
+        tracing_opentelemetry::layer().with_tracer(traces_provider.tracer("fslabscli"));
+
     tracing_subscriber::registry()
         .with(filter)
         .with(otel_layer)
+        .with(otel_tracer_layer)
         .with(fmt_layer)
         .init();
 
-    let traces_provider = init_traces();
     let metrics_provider = init_metrics(true);
 
     OtelGuard {
@@ -277,8 +282,11 @@ pub struct OtelGuard {
     log_provider: SdkLoggerProvider,
 }
 
-impl Drop for OtelGuard {
-    fn drop(&mut self) {
+impl OtelGuard {
+    fn shutdown(&self) {
+        let _ = self.traces_provider.force_flush();
+        let _ = self.metrics_provider.force_flush();
+        let _ = self.log_provider.force_flush();
         let _ = self.traces_provider.shutdown();
         let _ = self.metrics_provider.shutdown();
         let _ = self.log_provider.shutdown();
@@ -320,7 +328,7 @@ async fn main() -> ExitCode {
         .and_then(|matches| matches.get_one::<u8>("verbose").cloned())
         .unwrap_or(2);
 
-    let _guard = setup_logging(log_level);
+    let guard = setup_logging(log_level);
 
     let fslabscli_auto_update = matches
         .and_then(|matches| matches.get_one::<bool>("fslabscli_auto_update").cloned())
@@ -332,16 +340,27 @@ async fn main() -> ExitCode {
 
     let r = run().await;
 
-    match r {
+    let exit_code = match &r {
         Ok(r) => {
             println!("{r}");
-            ExitCode::SUCCESS
+            0
         }
         Err(e) => {
             tracing::error!("Could not execute command: {}", e);
-            ExitCode::FAILURE
+            1
         }
-    }
+    };
+
+    // Watchdog: force exit after 5s if telemetry flush hangs
+    let wd = exit_code;
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        std::process::exit(wd);
+    });
+
+    guard.shutdown();
+    drop(guard);
+    std::process::exit(exit_code)
 }
 
 async fn run() -> anyhow::Result<String> {
@@ -428,5 +447,39 @@ async fn run() -> anyhow::Result<String> {
                 "Request for completions script or man pages should have been handled earlier and the program should have exited then."
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use opentelemetry::trace::TracerProvider;
+    use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+    use tracing_opentelemetry::OpenTelemetryLayer;
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[test]
+    fn tracing_opentelemetry_layer_exports_spans() {
+        // Arrange
+        let exporter = InMemorySpanExporterBuilder::new().build();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer = provider.tracer("test");
+        let otel_layer = OpenTelemetryLayer::new(tracer);
+        let subscriber = Registry::default().with(otel_layer);
+
+        // Act
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("test_span");
+            let _guard = span.enter();
+        });
+
+        provider.force_flush().expect("flush failed");
+
+        // Assert
+        let finished = exporter.get_finished_spans().expect("failed to get spans");
+        assert_eq!(finished.len(), 1, "expected exactly one exported span");
+        assert_eq!(finished[0].name, "test_span");
     }
 }
