@@ -56,7 +56,7 @@ fn get_compatible_targets(detected_target: &str) -> Vec<String> {
 
 pub fn auto_update() -> Result<(), Box<dyn error::Error>> {
     let checker = self_update::backends::github::Update::configure()
-        .repo_owner("ForesightMiningSoftwareCorporation")
+        .repo_owner("fslabs")
         .repo_name("fslabscli")
         .bin_name("fslabscli")
         .current_version(cargo_crate_version!())

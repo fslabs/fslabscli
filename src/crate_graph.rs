@@ -1,7 +1,8 @@
 #[cfg(test)]
 use cargo_metadata::semver::Version;
 use cargo_metadata::{CargoOpt, DependencyKind, Metadata, MetadataCommand, Package, PackageId};
-use git2::{DiffDelta, Object, Repository};
+use gix::Repository;
+use gix::bstr::ByteSlice;
 use ignore::gitignore::Gitignore;
 use std::{
     borrow::Cow,
@@ -11,12 +12,21 @@ use std::{
 
 use crate::{cli_args::DiffStrategy, utils::get_registry_env};
 
+/// Controls how `cargo metadata` resolves features for dependency analysis.
+pub enum FeatureResolution {
+    /// Only run with `--all-features` (used for publishing).
+    AllFeaturesOnly,
+    /// Run twice: once with `--all-features` (for publishing deps), once with default features (for change detection).
+    DualGraph,
+}
+
 /// The (directed acyclic) graph of crates in a multi-workspace repo.
 #[derive(Clone, Debug)]
 pub struct CrateGraph {
     repo_root: PathBuf,
     workspaces: Vec<Workspace>,
     pub dependencies: DependencyGraph,
+    default_dependencies: Option<DependencyGraph>,
 }
 
 impl CrateGraph {
@@ -33,6 +43,7 @@ impl CrateGraph {
         repo_root: impl Into<PathBuf>,
         main_registry: impl Into<String> + Clone,
         dep_kind: Option<DependencyKind>,
+        feature_resolution: FeatureResolution,
     ) -> anyhow::Result<Self> {
         let repo_root = repo_root.into();
         let mut workspaces = Vec::new();
@@ -41,9 +52,26 @@ impl CrateGraph {
             eprintln!("Failed to find .gitignore: {err}");
         }
         let envs = get_registry_env(main_registry.clone().into());
-        Self::new_recursive(&repo_root, &ignore, &repo_root, &mut workspaces, &envs)?;
+        Self::new_recursive(
+            &repo_root,
+            &ignore,
+            &repo_root,
+            &mut workspaces,
+            &envs,
+            matches!(feature_resolution, FeatureResolution::DualGraph),
+        )?;
         workspaces.sort_by(|r1, r2| r1.path.cmp(&r2.path));
-        let dependencies = DependencyGraph::new(&repo_root, &workspaces, dep_kind);
+        let dependencies = DependencyGraph::new(&repo_root, &workspaces, dep_kind, false);
+        let default_dependencies = if matches!(feature_resolution, FeatureResolution::DualGraph) {
+            Some(DependencyGraph::new(
+                &repo_root,
+                &workspaces,
+                dep_kind,
+                true,
+            ))
+        } else {
+            None
+        };
         if let Some(cycles) = dependencies.detect_cycles() {
             return Err(anyhow::anyhow!("Cycle detected: {:?}", cycles));
         }
@@ -51,6 +79,7 @@ impl CrateGraph {
             repo_root,
             workspaces,
             dependencies,
+            default_dependencies,
         })
     }
 
@@ -60,6 +89,7 @@ impl CrateGraph {
         dir: &Path,
         workspaces: &mut Vec<Workspace>,
         envs: &HashMap<String, String>,
+        dual_graph: bool,
     ) -> anyhow::Result<()> {
         if let Some(name) = dir.file_name()
             && name == ".git"
@@ -74,14 +104,9 @@ impl CrateGraph {
         }
 
         let manifest_path = dir.join("Cargo.toml");
-        let lock_path = dir.join("Cargo.lock");
-        let orig_lock_content = match std::fs::exists(&lock_path)? {
-            true => Some(std::fs::read_to_string(&lock_path)?),
-            false => None,
-        };
 
         if std::fs::exists(&manifest_path)? {
-            // Found a manifest. Get metadata.
+            // Found a manifest. Get metadata with all features.
             let mut command = MetadataCommand::new();
             command.current_dir(dir);
             command.features(CargoOpt::AllFeatures);
@@ -90,19 +115,48 @@ impl CrateGraph {
             }
             let metadata = command.exec()?;
 
+            let default_metadata = if dual_graph {
+                let mut default_command = MetadataCommand::new();
+                default_command.current_dir(dir);
+                for (k, v) in envs {
+                    default_command.env(k, v);
+                }
+                Some(default_command.exec()?)
+            } else {
+                None
+            };
+
             let has_explicit_members = if metadata.root_package().is_some() {
                 metadata.workspace_members.len() > 1
             } else {
                 !metadata.workspace_members.is_empty()
             };
-            workspaces.push(Workspace {
-                path: relative_path(repo_root, dir)
-                    .expect("Subdirectory must have ancestor path prefix")
-                    .into(),
-                metadata,
-            });
-            // crate_graph runs `cargo metadata` under the hood. This can updates the Cargo.lock
-            // we want to track that behavior
+            // Use the actual workspace root from cargo metadata, not the
+            // directory we found the manifest in. A crate that is a member of
+            // a parent workspace will report the parent as workspace_root;
+            // using `dir` would create a workspace entry at the wrong path
+            // (e.g. pointing at a member's deleted Cargo.lock instead of the
+            // root workspace's Cargo.lock).
+            let ws_root = metadata.workspace_root.as_std_path();
+            let ws_path: PathBuf = relative_path(repo_root, ws_root)
+                .expect("Workspace root must be within the repo root")
+                .into();
+            // Save/restore the workspace root's Cargo.lock, since
+            // `cargo metadata` may modify it as a side effect.
+            let lock_path = ws_root.join("Cargo.lock");
+            let orig_lock_content = match std::fs::exists(&lock_path)? {
+                true => Some(std::fs::read_to_string(&lock_path)?),
+                false => None,
+            };
+            if !workspaces.iter().any(|w| w.path == ws_path) {
+                workspaces.push(Workspace {
+                    path: ws_path,
+                    metadata,
+                    default_metadata,
+                });
+            }
+            // crate_graph runs `cargo metadata` under the hood. This can update the Cargo.lock;
+            // we want to revert that behavior.
             let updated_lock_content = match std::fs::exists(&lock_path)? {
                 true => Some(std::fs::read_to_string(&lock_path)?),
                 false => None,
@@ -135,7 +189,14 @@ impl CrateGraph {
             let entry = entry?;
             let metadata = entry.metadata()?;
             if metadata.is_dir() {
-                Self::new_recursive(repo_root, ignore, &entry.path(), workspaces, envs)?;
+                Self::new_recursive(
+                    repo_root,
+                    ignore,
+                    &entry.path(),
+                    workspaces,
+                    envs,
+                    dual_graph,
+                )?;
             }
         }
 
@@ -150,6 +211,12 @@ impl CrateGraph {
         &self.dependencies
     }
 
+    pub fn default_dependency_graph(&self) -> &DependencyGraph {
+        self.default_dependencies
+            .as_ref()
+            .unwrap_or(&self.dependencies)
+    }
+
     /// All cargo packages in the repo.
     pub fn packages(&self) -> impl Iterator<Item = &Package> {
         self.workspaces()
@@ -158,85 +225,90 @@ impl CrateGraph {
     }
 
     /// Determines which packages have changed between `old_rev` and `new_rev`. (Un)Staged changes are considered
-    pub fn changed_packages<'r>(
+    pub fn changed_packages(
         &self,
-        repository: &'r Repository,
-        old_commit: Object<'r>,
-        new_commit: Object<'r>,
+        repository: &Repository,
+        old_commit_id: gix::ObjectId,
+        new_commit_id: gix::ObjectId,
         diff_strategy: &DiffStrategy,
     ) -> anyhow::Result<Vec<PathBuf>> {
-        // Create git diff between revisions.
-        let old_tree = old_commit.peel_to_tree()?;
-        let new_tree = new_commit.peel_to_tree()?;
+        let old_tree = repository.find_commit(old_commit_id)?.tree()?;
+        let new_tree = repository.find_commit(new_commit_id)?.tree()?;
 
-        // Get index and working directory state
-        let index = repository.index()?;
-
-        // Create diffs:
-        // - one between old_rev and new_rev,
-        // - and another between new_rev and current state staged
-        // - and another between new_rev and current state unstaged
-        let diff_old_new = repository.diff_tree_to_tree(Some(&old_tree), Some(&new_tree), None)?;
-        let diff_new_staged = repository.diff_tree_to_index(Some(&new_tree), Some(&index), None)?;
-        let diff_new_unstaged = repository.diff_index_to_workdir(Some(&index), None)?;
-
-        // Check each package path against each file paths in git diff.
         let mut changed = Vec::new();
         let mut packages = self.packages().collect::<Vec<_>>();
-        // Sort packages so that we look at the subpackages first:
-        // - workspace/crate_a/subcrate
-        // - workspace/crate_a
-        // - workspace/crate_b
-        // - workspace
         packages.sort_by_key(|package| package_path(&self.repo_root, package).iter().count());
         packages.reverse();
 
-        // For each change, find the most specific package modified
-        let mut file_cb = |delta: DiffDelta, _: f32| -> bool {
-            for delta_path in [delta.old_file().path(), delta.new_file().path()]
-                .into_iter()
-                .flatten()
-            {
-                for package in &packages {
-                    let package_path = package_path(&self.repo_root, package).into_owned();
-
-                    // If package_path is ".", treat it as the entire repo
-                    let is_repo_root = package_path == Path::new(".");
-
-                    if delta_path.ends_with("rust-toolchain.toml") {
-                        // We have a special case, the `rust-toolchain.toml` file, if it changed, everything should be considered as changed
-                        changed.push(package_path.clone());
-                        continue;
-                    }
-                    if is_repo_root
-                        || delta_path.starts_with(&package_path)
-                        || delta_path.ends_with("rust-toolchain.toml")
-                    {
-                        changed.push(package_path.clone());
-                        // Stop processing this change, we found the most specific package impacted
-                        // Returning true will continue matching other file changed in case a commit targets several packages
-                        return true;
-                    }
+        let mut record_change = |delta_path: &Path| {
+            for package in &packages {
+                let pkg_path = package_path(&self.repo_root, package).into_owned();
+                let is_repo_root = pkg_path == Path::new(".");
+                if delta_path.ends_with("rust-toolchain.toml") {
+                    changed.push(pkg_path.clone());
+                    continue;
+                }
+                if is_repo_root || delta_path.starts_with(&pkg_path) {
+                    changed.push(pkg_path.clone());
+                    return;
                 }
             }
-            true
         };
-        // Returning early from a callback will propagate an error for some
-        // reason. Ignore it.
-        let _ = diff_old_new.foreach(&mut file_cb, None, None, None);
 
-        // Only check changes on staged and unstaged when not using the explicit strategy
+        // Tree-to-tree diff (gix native)
+        old_tree
+            .changes()?
+            .for_each_to_obtain_tree(&new_tree, |change| {
+                match change.location().to_path() {
+                    Ok(path) => {
+                        record_change(path);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Skipping non-UTF8 path in diff: {}", e);
+                    }
+                }
+                Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Continue(()))
+            })?;
+
+        // Staged + unstaged (git CLI, only for non-Explicit strategies)
         match diff_strategy {
             DiffStrategy::Explicit { .. } => {}
             _ => {
-                let _ = diff_new_staged.foreach(&mut file_cb, None, None, None);
-                let _ = diff_new_unstaged.foreach(&mut file_cb, None, None, None);
+                // Staged: diff new_commit tree vs current index
+                let output = std::process::Command::new("git")
+                    .args([
+                        "diff",
+                        "--cached",
+                        "--name-only",
+                        &new_commit_id.to_string(),
+                    ])
+                    .current_dir(&self.repo_root)
+                    .output()?;
+                if output.status.success() {
+                    for line in String::from_utf8_lossy(&output.stdout).lines() {
+                        if !line.is_empty() {
+                            record_change(Path::new(line));
+                        }
+                    }
+                }
+
+                // Unstaged: diff index vs workdir
+                let output = std::process::Command::new("git")
+                    .args(["diff", "--name-only"])
+                    .current_dir(&self.repo_root)
+                    .output()?;
+                if output.status.success() {
+                    for line in String::from_utf8_lossy(&output.stdout).lines() {
+                        if !line.is_empty() {
+                            record_change(Path::new(line));
+                        }
+                    }
+                }
             }
         }
 
         changed.sort();
-        changed.dedup(); // Remove duplicates if package changed in multiple diffs
-
+        changed.dedup();
         Ok(changed)
     }
 }
@@ -249,6 +321,7 @@ impl CrateGraph {
 pub struct Workspace {
     pub path: PathBuf,
     pub metadata: Metadata,
+    default_metadata: Option<Metadata>,
 }
 
 impl Workspace {
@@ -314,6 +387,7 @@ impl DependencyGraph {
         repo_root: &Path,
         workspaces: &[Workspace],
         dep_kind: Option<DependencyKind>,
+        use_default_features: bool,
     ) -> Self {
         let mut me = Self::default();
 
@@ -321,6 +395,11 @@ impl DependencyGraph {
             // Create the 1:1 bidirectional map between path and package ID.
             for p in w.metadata.workspace_packages() {
                 let p_dir_path = package_path(repo_root, p).into_owned();
+                tracing::debug!(
+                    package_id = %p.id,
+                    path = %p_dir_path.display(),
+                    "registering package"
+                );
                 me.path_to_id.insert(p_dir_path.clone(), p.id.clone());
                 me.id_to_path.insert(p.id.clone(), p_dir_path);
                 me.id_to_package.insert(p.id.clone(), p.clone());
@@ -332,9 +411,19 @@ impl DependencyGraph {
 
         for w in workspaces {
             // Create the M:N bidirectional dependency map between package IDs.
-            let resolve = w.metadata.resolve.as_ref().unwrap();
+            let metadata_for_resolve = if use_default_features {
+                w.default_metadata.as_ref().unwrap_or(&w.metadata)
+            } else {
+                &w.metadata
+            };
+            let resolve = metadata_for_resolve.resolve.as_ref().unwrap();
             for node in &resolve.nodes {
-                if me.id_to_path.contains_key(&node.id) {
+                if !me.id_to_path.contains_key(&node.id) {
+                    tracing::debug!(
+                        node_id = %node.id,
+                        "skipping resolve node: not a registered workspace package"
+                    );
+                } else if me.id_to_path.contains_key(&node.id) {
                     let self_package = me.id_to_package.get(&node.id);
                     let deps = me.dependencies.get_mut(&node.id).unwrap();
                     for node_dep in &node.deps {
@@ -384,6 +473,12 @@ impl DependencyGraph {
                             None => true,
                         };
                         if is_accepted_dep && me.id_to_path.contains_key(dep_id) {
+                            tracing::debug!(
+                                source_id = %node.id,
+                                dep_id = %dep_id,
+                                dep_name = %node_dep.name,
+                                "adding dependency edge"
+                            );
                             let reverse_deps = me.reverse_dependencies.get_mut(dep_id).unwrap();
                             let dep = Dependency {
                                 package_id: dep_id.clone(),
@@ -391,11 +486,21 @@ impl DependencyGraph {
                             };
                             deps.push(dep);
                             reverse_deps.push(node.id.clone());
+                        } else if is_accepted_dep && !me.id_to_path.contains_key(dep_id) {
+                            tracing::trace!(
+                                source_id = %node.id,
+                                dep_id = %dep_id,
+                                dep_name = %node_dep.name,
+                                "skipping external dependency edge"
+                            );
                         }
                     }
                 }
             }
         }
+
+        let total_edges: usize = me.dependencies.values().map(|deps| deps.len()).sum();
+        tracing::debug!(total_edges, "dependency graph construction complete");
 
         me
     }
@@ -559,8 +664,8 @@ pub fn find_git_root(start: impl AsRef<Path>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use crate::utils::test::{
-        FAKE_REGISTRY, commit_all_changes, commit_repo, create_complex_workspace, modify_file,
-        stage_file,
+        FAKE_REGISTRY, commit_all_changes, commit_repo, create_complex_workspace, init_repo,
+        initialize_workspace, modify_file, stage_file,
     };
 
     use super::*;
@@ -570,7 +675,7 @@ mod tests {
     fn test_discover_standalone_workspace() {
         let repo = initialize_repo().join("standalone");
 
-        let graph = CrateGraph::new(&repo, "", None).unwrap();
+        let graph = CrateGraph::new(&repo, "", None, FeatureResolution::AllFeaturesOnly).unwrap();
         let workspaces = graph.workspaces();
         assert_eq!(workspaces.len(), 1);
         assert_eq!(workspaces[0].path, Path::new("."));
@@ -587,7 +692,7 @@ mod tests {
     fn test_discover_many_workspaces() {
         let repo = initialize_repo();
 
-        let graph = CrateGraph::new(&repo, "", None).unwrap();
+        let graph = CrateGraph::new(&repo, "", None, FeatureResolution::AllFeaturesOnly).unwrap();
         let workspaces = graph.workspaces();
         assert_eq!(workspaces.len(), 5);
         let mut i = workspaces.iter();
@@ -665,8 +770,9 @@ mod tests {
     #[test]
     fn test_detect_changed_packages() {
         let repo_root = initialize_repo();
-        let graph = CrateGraph::new(&repo_root, "", None).unwrap();
-        let repo = Repository::open(repo_root).unwrap();
+        let graph =
+            CrateGraph::new(&repo_root, "", None, FeatureResolution::AllFeaturesOnly).unwrap();
+        let repo = gix::open(repo_root).unwrap();
         // Use LocalChanges strategy to compare HEAD~ vs HEAD
         let diff_strategy = DiffStrategy::LocalChanges;
         let (base_commit, head_commit) = diff_strategy.git_commits(&repo).unwrap();
@@ -682,8 +788,9 @@ mod tests {
     #[test]
     fn test_detect_changed_package_single_rust_crate() {
         let repo_root = create_simple_rust_crate();
-        let graph = CrateGraph::new(&repo_root, "", None).unwrap();
-        let repo = Repository::open(repo_root).unwrap();
+        let graph =
+            CrateGraph::new(&repo_root, "", None, FeatureResolution::AllFeaturesOnly).unwrap();
+        let repo = gix::open(repo_root).unwrap();
         // Use LocalChanges strategy to compare HEAD~ vs HEAD
         let diff_strategy = DiffStrategy::LocalChanges;
         let (base_commit, head_commit) = diff_strategy.git_commits(&repo).unwrap();
@@ -697,9 +804,10 @@ mod tests {
     #[test]
     fn test_detect_changed_package_unstaged_file() {
         let repo_root = create_simple_rust_crate();
-        let graph = CrateGraph::new(&repo_root, "", None).unwrap();
+        let graph =
+            CrateGraph::new(&repo_root, "", None, FeatureResolution::AllFeaturesOnly).unwrap();
         modify_file(&repo_root, "src/lib.rs", "pub fn new_function_again() {}");
-        let repo = Repository::open(repo_root).unwrap();
+        let repo = gix::open(repo_root).unwrap();
         let diff_strategy = DiffStrategy::WorktreeVsBranch {
             branch: "HEAD".to_string(),
         };
@@ -714,11 +822,12 @@ mod tests {
     #[test]
     fn test_detect_changed_package_staged_file() {
         let repo_root = create_simple_rust_crate();
-        let graph = CrateGraph::new(&repo_root, "", None).unwrap();
+        let graph =
+            CrateGraph::new(&repo_root, "", None, FeatureResolution::AllFeaturesOnly).unwrap();
         modify_file(&repo_root, "src/lib.rs", "pub fn new_function_again() {}");
         stage_file(&repo_root, "src/lib.rs");
 
-        let repo = Repository::open(repo_root).unwrap();
+        let repo = gix::open(repo_root).unwrap();
         let diff_strategy = DiffStrategy::WorktreeVsBranch {
             branch: "HEAD".to_string(),
         };
@@ -753,18 +862,7 @@ mod tests {
             .into_persistent()
             .to_path_buf();
 
-        let repo = Repository::init(&tmp).expect("Failed to init repo");
-
-        // Configure Git user info (required for commits)
-        repo.config()
-            .unwrap()
-            .set_str("user.name", "Test User")
-            .unwrap();
-        repo.config()
-            .unwrap()
-            .set_str("user.email", "test@example.com")
-            .unwrap();
-        repo.config().unwrap().set_str("gpg.sign", "false").unwrap();
+        init_repo(&tmp);
 
         Command::new("cargo")
             .arg("init")
@@ -846,7 +944,7 @@ mod tests {
     #[test]
     fn test_no_cycles_dont_fail() {
         let repo = create_complex_workspace(true);
-        let graph = CrateGraph::new(&repo, "", None);
+        let graph = CrateGraph::new(&repo, "", None, FeatureResolution::AllFeaturesOnly);
         assert!(graph.is_ok());
     }
 
@@ -868,7 +966,7 @@ mod tests {
             .output()
             .expect("Failed to add workspace_a__crates_b");
         commit_all_changes(&repo, "Add simple cycle");
-        let graph = CrateGraph::new(&repo, "", None);
+        let graph = CrateGraph::new(&repo, "", None, FeatureResolution::AllFeaturesOnly);
         assert!(graph.is_err());
         let error = graph.unwrap_err();
         assert!(&format!("{}", error).starts_with("`cargo metadata` exited with an error:"));
@@ -895,7 +993,7 @@ mod tests {
             .expect("Failed to add workspace_a__crates_b");
         commit_all_changes(&repo, "Add simple cycle");
         println!("Got repo: {}", repo.display());
-        let graph = CrateGraph::new(&repo, "", None);
+        let graph = CrateGraph::new(&repo, "", None, FeatureResolution::AllFeaturesOnly);
         assert!(graph.is_err());
         let error = graph.unwrap_err();
         assert!(&format!("{}", error).starts_with("`cargo metadata` exited with an error:"));
@@ -920,7 +1018,7 @@ mod tests {
             .expect("Failed to add workspace_a__crates_b");
         commit_all_changes(&repo, "Add simple cycle");
         println!("Got repo: {}", repo.display());
-        let graph = CrateGraph::new(&repo, "", None);
+        let graph = CrateGraph::new(&repo, "", None, FeatureResolution::AllFeaturesOnly);
         assert!(graph.is_ok());
     }
 
@@ -944,7 +1042,74 @@ crates_g = {{ version = "0.1.0", path = "../../../crates_g", registry = "fake-re
         )
         .unwrap();
         commit_all_changes(&repo, "Add simple cycle");
-        let graph = CrateGraph::new(&repo, "", None);
+        let graph = CrateGraph::new(&repo, "", None, FeatureResolution::AllFeaturesOnly);
         assert!(graph.is_err());
+    }
+
+    #[test]
+    fn test_dual_graph_narrows_reverse_closure() {
+        // Create a workspace with two crates where crate_a optionally depends on crate_b.
+        // With --all-features: crate_a -> crate_b (edge exists)
+        // With default features: no edge between them
+        let tmp = assert_fs::TempDir::new()
+            .unwrap()
+            .into_persistent()
+            .to_path_buf();
+
+        init_repo(&tmp);
+        initialize_workspace(&tmp, "ws", vec!["crate_a", "crate_b"], vec![], false);
+
+        // Make crate_b an optional dependency of crate_a, gated behind a feature.
+        // cargo init emits an empty [dependencies] section, so we inject the optional dep into
+        // that existing section rather than appending a duplicate [dependencies] header.
+        let crate_a_toml = tmp.join("ws/crates/crate_a/Cargo.toml");
+        let original = std::fs::read_to_string(&crate_a_toml).unwrap();
+        let patched = original.replacen(
+            "[dependencies]",
+            &format!(
+                "[dependencies]\nws__crate_b = {{ path = \"../crate_b\", optional = true, registry = \"{FAKE_REGISTRY}\" }}\n\n[features]\nwith_b = [\"dep:ws__crate_b\"]"
+            ),
+            1,
+        );
+        std::fs::write(&crate_a_toml, patched).unwrap();
+
+        commit_all_changes(&tmp, "workspace with optional dep");
+
+        let graph = CrateGraph::new(&tmp, "", None, FeatureResolution::DualGraph).unwrap();
+
+        let crate_b_path = Path::new("ws").join("crates").join("crate_b");
+
+        // All-features graph: changing crate_b should pull in crate_a via reverse closure
+        let all_features_closure = graph
+            .dependency_graph()
+            .reverse_closure([crate_b_path.as_path()]);
+
+        // Default-features graph: changing crate_b should NOT pull in crate_a
+        let default_closure = graph
+            .default_dependency_graph()
+            .reverse_closure([crate_b_path.as_path()]);
+
+        // The all-features closure should include both crate_a and crate_b
+        let crate_a_path = Path::new("ws").join("crates").join("crate_a");
+        assert!(
+            all_features_closure.contains(&crate_a_path),
+            "all-features closure should include crate_a (depends on crate_b via optional dep), got: {all_features_closure:?}"
+        );
+        assert!(all_features_closure.contains(&crate_b_path));
+
+        // The default closure should only include crate_b (no edge to crate_a)
+        assert!(
+            !default_closure.contains(&crate_a_path),
+            "default closure should NOT include crate_a (optional dep not enabled), got: {default_closure:?}"
+        );
+        assert!(default_closure.contains(&crate_b_path));
+
+        // The default closure is strictly smaller
+        assert!(
+            default_closure.len() < all_features_closure.len(),
+            "default closure ({}) should be smaller than all-features closure ({})",
+            default_closure.len(),
+            all_features_closure.len()
+        );
     }
 }

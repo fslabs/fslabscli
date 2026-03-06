@@ -1,6 +1,5 @@
 use chrono::{Duration, prelude::*};
 use core::result::Result as CoreResult;
-use git2::Repository;
 use std::cmp;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -26,7 +25,7 @@ use strum_macros::EnumString;
 
 use crate::cli_args::{DiffOptions, DiffStrategy};
 use crate::commands::check_workspace::binary::BinaryStore;
-use crate::crate_graph::CrateGraph;
+use crate::crate_graph::{CrateGraph, FeatureResolution};
 use crate::test_args::TestArgs;
 use crate::utils::cargo::CrateChecker;
 use crate::utils::docker::{Docker, RealHttpClient, RealOciClient};
@@ -889,6 +888,7 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
             &self.repo_root,
             self.common_options.cargo_main_registry.clone(),
             limit_dependency_kind,
+            FeatureResolution::DualGraph,
         )?;
 
         let mut packages: HashMap<PackageId, Result> = HashMap::new();
@@ -1241,17 +1241,17 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
                 ));
             }
 
-            let repo = Repository::open(self.repo_root)?;
-            let (base_commit, head_commit) = diff_strategy.git_commits(&repo)?;
+            let repo = gix::open(&self.repo_root)?;
+            let (base_commit_id, head_commit_id) = diff_strategy.git_commits(&repo)?;
             // Check changed from a git pov
             let changed_package_paths =
-                crates.changed_packages(&repo, base_commit, head_commit, &diff_strategy)?;
-            tracing::info!("Changed packages: {changed_package_paths:#?}");
+                crates.changed_packages(&repo, base_commit_id, head_commit_id, &diff_strategy)?;
+            tracing::debug!("Changed packages: {changed_package_paths:#?}");
             // Any packages that transitively depend on changed packages are also considered "changed".
             let changed_closure = crates
-                .dependency_graph()
+                .default_dependency_graph()
                 .reverse_closure(changed_package_paths.iter().map(AsRef::as_ref));
-            tracing::info!("Changed closure: {changed_closure:#?}");
+            tracing::debug!("Changed closure: {changed_closure:#?}");
 
             for package_key in package_keys.clone() {
                 if let Some(ref pb) = pb {

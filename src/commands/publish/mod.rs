@@ -2,7 +2,6 @@ use anyhow::Context;
 use aws_sdk_cloudfront as cloudfront;
 use cargo_metadata::{DependencyKind, PackageId};
 use clap::Parser;
-use git2::Repository;
 use junit_report::{Duration, ReportBuilder, TestCase, TestSuiteBuilder};
 use mime_guess;
 use octocrab::Octocrab;
@@ -133,7 +132,9 @@ impl PublishDetailResult {
                 };
                 let mut tc = match self.success {
                     true => TestCase::success(&self.name, duration),
-                    false => TestCase::failure(&self.name, duration, &self.name, "required"),
+                    false => {
+                        TestCase::failure(&self.name, duration, "publish_failure", &self.stderr)
+                    }
                 };
                 // stdout and stderr are inverted because we want to still output stderr on console
                 tc.set_system_out(&self.stderr);
@@ -173,28 +174,30 @@ pub struct PublishResult {
 
 impl PublishResult {
     pub fn new(package: &Package, registries: HashSet<String>, options: &Options) -> Self {
+        let crate_name = &package.package;
+        let crate_version = &package.version;
         let mut s = Self {
             should_publish: package.publish,
             docker: PublishDetailResult {
-                name: "docker buildx build && docker push".to_string(),
+                name: format!("{crate_name}@{crate_version} docker buildx build && docker push"),
                 key: "docker".to_string(),
                 should_publish: package.publish_detail.docker.publish,
                 ..Default::default()
             },
             nix_binary: PublishDetailResult {
-                name: "nix build .#release".to_string(),
+                name: format!("{crate_name}@{crate_version} nix build .#release"),
                 key: "nix".to_string(),
                 should_publish: package.publish_detail.nix_binary.publish,
                 ..Default::default()
             },
             git_tag: PublishDetailResult {
-                name: "git tag".to_string(),
+                name: format!("{crate_name}@{crate_version} git tag"),
                 key: "git".to_string(),
                 should_publish: options.handle_tags,
                 ..Default::default()
             },
             s3: PublishDetailResult {
-                name: "s3".to_string(),
+                name: format!("{crate_name}@{crate_version} s3"),
                 key: "s3".to_string(),
                 should_publish: package.publish_detail.s3.publish,
                 ..Default::default()
@@ -212,7 +215,7 @@ impl PublishResult {
                         .registries_publish
                         .get(registry_name)
                         .unwrap_or(&false),
-                    name: format!("cargo publish -r {registry_name}"),
+                    name: format!("{crate_name}@{crate_version} cargo publish -r {registry_name}"),
                     key: format!("cargo_{registry_name}"),
                     ..Default::default()
                 },
@@ -224,6 +227,25 @@ impl PublishResult {
 
     pub fn with_failed(mut self, failed: bool) -> Self {
         self.success = !failed;
+        if failed {
+            for detail in [
+                &mut self.docker,
+                &mut self.nix_binary,
+                &mut self.git_tag,
+                &mut self.s3,
+            ] {
+                if detail.should_publish && detail.stderr.is_empty() {
+                    detail.success = false;
+                    detail.stderr = "skipped: a dependency failed to publish".to_string();
+                }
+            }
+            for detail in self.cargo.values_mut() {
+                if detail.should_publish && detail.stderr.is_empty() {
+                    detail.success = false;
+                    detail.stderr = "skipped: a dependency failed to publish".to_string();
+                }
+            }
+        }
         self
     }
 }
@@ -906,6 +928,10 @@ async fn do_publish_package(params: DoPublishParams) -> PublishResult {
             for (registry_name, registry_publish) in package.publish_detail.cargo.registries_publish
             {
                 let mut r = PublishDetailResult {
+                    name: format!(
+                        "{package_name}@{package_version} cargo publish -r {registry_name}"
+                    ),
+                    key: format!("cargo_{registry_name}"),
                     start_time: Some(SystemTime::now()),
                     ..Default::default()
                 };
@@ -961,16 +987,24 @@ async fn do_publish_package(params: DoPublishParams) -> PublishResult {
                         .as_ref()
                         .and_then(|p| std::fs::read_to_string(p).ok());
 
-                    if patch_crate_for_registry(
+                    if let Err(patch_err) = patch_crate_for_registry(
                         &repo_root,
                         &package_path,
                         original_registry,
                         target_registry,
                         cargo.http_client(),
                         &member_paths,
-                    )
-                    .is_ok()
-                    {
+                    ) {
+                        tracing::error!(
+                            registry = %registry_name,
+                            error = %patch_err,
+                            "patch_crate_for_registry failed"
+                        );
+                        r.success = false;
+                        r.stderr = format!(
+                            "patch_crate_for_registry failed for registry {registry_name}: {patch_err}"
+                        );
+                    } else {
                         // to publish to a registry we need
                         // - index url
                         // - user agent if set
@@ -1004,11 +1038,6 @@ async fn do_publish_package(params: DoPublishParams) -> PublishResult {
                                 .execute()
                                 .await;
                         r.update_from_command(command_output);
-                    } else {
-                        r.success = false;
-                        r.stderr = format!(
-                            "registry {registry_name} not setup correctly, missing index, private_key, and token"
-                        );
                     }
 
                     // Restore workspace Cargo.lock before patch-back to avoid lock file corruption
@@ -1018,22 +1047,32 @@ async fn do_publish_package(params: DoPublishParams) -> PublishResult {
                         let _ = std::fs::write(lock_path, content);
                     }
 
-                    // Path back to the main registry
-                    if patch_crate_for_registry(
+                    // Patch back to the main registry
+                    if let Err(patch_back_err) = patch_crate_for_registry(
                         &repo_root,
                         &package_path,
                         target_registry,
                         original_registry,
                         cargo.http_client(),
                         &member_paths,
-                    )
-                    .is_err()
-                    {
-                        r.success = false;
-                        r.stderr = format!(
-                            "registry {} not setup correctly, missing index, private_key, and token",
-                            common_options.cargo_main_registry.clone()
+                    ) {
+                        tracing::error!(
+                            registry = %common_options.cargo_main_registry,
+                            error = %patch_back_err,
+                            "patch_crate_for_registry failed to restore registry"
                         );
+                        r.success = false;
+                        if r.stderr.is_empty() {
+                            r.stderr = format!(
+                                "patch_crate_for_registry failed restoring registry {}: {patch_back_err}",
+                                common_options.cargo_main_registry,
+                            );
+                        } else {
+                            r.stderr = format!(
+                                "{}\npatch_crate_for_registry failed restoring registry {}: {patch_back_err}",
+                                r.stderr, common_options.cargo_main_registry,
+                            );
+                        }
                     }
                     is_failed = !r.success;
                 }
@@ -1161,13 +1200,9 @@ async fn do_publish_package(params: DoPublishParams) -> PublishResult {
                 options.github_app_private_key.clone(),
             ) {
                 result.git_tag.stdout = format!("{}\nRetrieving git HEAD", result.git_tag.stdout);
-                let Some(head) = Repository::open(&repo_root)
+                let Some(head) = gix::open(&repo_root)
                     .ok()
-                    .as_ref()
-                    .and_then(|r| r.head().ok())
-                    .as_ref()
-                    .and_then(|head| head.peel_to_commit().ok())
-                    .map(|head| head.id().to_string())
+                    .and_then(|r| r.head_commit().map(|commit| commit.id().to_string()).ok())
                 else {
                     return Err(anyhow::Error::msg("Failed to get git HEAD"));
                 };
@@ -1248,43 +1283,36 @@ pub async fn login(options: &Options, repo_root: &PathBuf) -> anyhow::Result<()>
 
 /// Resolves a commit SHA (or git reference) to a git tag name.
 /// This is used to find the GitHub release tag associated with a commit.
-/// Uses git2's describe functionality for efficient exact-match tag lookup.
+/// Uses git CLI's describe functionality for efficient exact-match tag lookup.
 /// Filters tags by the provided pattern (e.g., "v*" or "cargo-fslabscli-*")
 fn resolve_commit_to_tag(
     repo_root: &PathBuf,
     commit_ref: &str,
     tag_pattern: &str,
 ) -> anyhow::Result<String> {
-    let repo = Repository::open(repo_root)
-        .with_context(|| format!("Failed to open git repository at {:?}", repo_root))?;
+    let output = std::process::Command::new("git")
+        .args([
+            "describe",
+            "--tags",
+            "--exact-match",
+            &format!("--match={}", tag_pattern),
+            commit_ref,
+        ])
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| format!("Failed to run git describe for {}", commit_ref))?;
 
-    // Resolve the reference to a commit
-    let obj = repo
-        .revparse_single(commit_ref)
-        .with_context(|| format!("Failed to resolve git reference: {}", commit_ref))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "No tag matching pattern '{}' found for commit {}: {}",
+            tag_pattern,
+            commit_ref,
+            stderr.trim()
+        );
+    }
 
-    // Use git2's describe with exact match option
-    let mut describe_options = git2::DescribeOptions::new();
-    describe_options
-        .describe_tags()
-        .show_commit_oid_as_fallback(false)
-        .pattern(tag_pattern);
-
-    let describe_result = obj.describe(&describe_options).with_context(|| {
-        format!(
-            "No tag matching pattern '{}' found for commit {}",
-            tag_pattern, commit_ref
-        )
-    })?;
-
-    // Format without any suffix (just the tag name)
-    let mut format_options = git2::DescribeFormatOptions::new();
-    format_options.abbreviated_size(0);
-
-    let tag = describe_result
-        .format(Some(&format_options))
-        .with_context(|| "Failed to format describe result")?;
-
+    let tag = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok(tag)
 }
 
@@ -1312,11 +1340,12 @@ pub async fn report_publish_to_github(
         let base_rev = options.base_rev.as_deref().unwrap_or("HEAD");
 
         // Check if base_rev is already a tag name by trying to verify it exists as a tag
-        let repo = Repository::open(repo_root)
+        let repo = gix::open(repo_root)
             .with_context(|| format!("Failed to open git repository at {:?}", repo_root))?;
 
-        let release_tag = if let Ok(_tag_ref) =
-            repo.find_reference(&format!("refs/tags/{}", base_rev))
+        let release_tag = if repo
+            .find_reference(&format!("refs/tags/{}", base_rev))
+            .is_ok()
         {
             // base_rev is already a valid tag name, use it directly
             tracing::info!("Using {} as release tag (already a valid tag)", base_rev);
@@ -1461,7 +1490,11 @@ pub async fn publish(
             registries.insert(registry_name.clone());
         }
     }
-    let member_paths: Vec<PathBuf> = results.members.values().map(|m| m.path.clone()).collect();
+    let member_paths: Vec<PathBuf> = results
+        .members
+        .values()
+        .map(|m| repo_root.join(&m.path))
+        .collect();
     let member_paths = Arc::new(member_paths);
     // Filters members based on regex
     // Spawn a task for each object
@@ -1533,28 +1566,18 @@ pub async fn publish(
 
 #[cfg(test)]
 mod tests {
-    use git2::{Repository, Signature};
     use std::path::PathBuf;
+    use std::process::Command;
 
     use super::resolve_commit_to_tag;
-    use crate::utils::test::{commit_all_changes, modify_file};
+    use crate::utils::test::{commit_all_changes, init_repo, modify_file};
 
     /// Helper function to create a test git repository with initial commit
     fn create_test_repo() -> (assert_fs::TempDir, PathBuf) {
         let temp_dir = assert_fs::TempDir::new().expect("Failed to create temp directory");
         let repo_path = temp_dir.path().to_path_buf();
 
-        let repo = Repository::init(&repo_path).expect("Failed to init repository");
-
-        // Configure Git user info (required for commits)
-        repo.config()
-            .unwrap()
-            .set_str("user.name", "Test User")
-            .unwrap();
-        repo.config()
-            .unwrap()
-            .set_str("user.email", "test@example.com")
-            .unwrap();
+        init_repo(&repo_path);
 
         // Create initial file and commit
         modify_file(&repo_path, "README.md", "# Test Repository");
@@ -1564,27 +1587,28 @@ mod tests {
     }
 
     /// Helper function to create a commit in the repository
-    fn create_commit(repo_path: &PathBuf, message: &str) -> git2::Oid {
+    fn create_commit(repo_path: &PathBuf, message: &str) -> String {
         // Modify a file to have something to commit
         modify_file(repo_path, "test.txt", &format!("Content for {}", message));
         commit_all_changes(repo_path, message);
 
-        // Get the commit OID
-        let repo = Repository::open(repo_path).expect("Failed to open repository");
-        repo.head()
-            .expect("Failed to get HEAD")
-            .target()
-            .expect("HEAD has no target")
+        // Get the commit SHA
+        let output = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo_path)
+            .output()
+            .expect("Failed to get HEAD SHA");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
     /// Helper function to create a lightweight tag pointing to a commit
-    fn create_tag(repo_path: &PathBuf, tag_name: &str, commit_oid: git2::Oid) {
-        let repo = Repository::open(repo_path).expect("Failed to open repository");
-        let commit = repo.find_commit(commit_oid).expect("Failed to find commit");
-        let obj = commit.as_object();
-
-        repo.tag_lightweight(tag_name, obj, false)
+    fn create_tag(repo_path: &PathBuf, tag_name: &str, commit_sha: &str) {
+        let output = Command::new("git")
+            .args(["tag", tag_name, commit_sha])
+            .current_dir(repo_path)
+            .output()
             .expect("Failed to create tag");
+        assert!(output.status.success(), "git tag failed: {:?}", output);
     }
 
     #[test]
@@ -1592,7 +1616,7 @@ mod tests {
         // Test: A commit with cargo-fslabscli-* tag (project's actual format)
         let (_temp_dir, repo_path) = create_test_repo();
         let commit_oid = create_commit(&repo_path, "Add feature");
-        create_tag(&repo_path, "cargo-fslabscli-2.29.1", commit_oid);
+        create_tag(&repo_path, "cargo-fslabscli-2.29.1", &commit_oid);
 
         let result = resolve_commit_to_tag(&repo_path, "HEAD", "cargo-fslabscli-*");
         assert!(result.is_ok(), "Should successfully resolve to tag");
@@ -1604,7 +1628,7 @@ mod tests {
         // Test: A commit with a version tag (v-prefixed) should return that tag
         let (_temp_dir, repo_path) = create_test_repo();
         let commit_oid = create_commit(&repo_path, "Add feature");
-        create_tag(&repo_path, "v2.29.1", commit_oid);
+        create_tag(&repo_path, "v2.29.1", &commit_oid);
 
         let result = resolve_commit_to_tag(&repo_path, "HEAD", "v*");
         assert!(result.is_ok(), "Should successfully resolve to tag");
@@ -1618,10 +1642,10 @@ mod tests {
         let commit_oid = create_commit(&repo_path, "Release commit");
 
         // Create tags with different patterns
-        create_tag(&repo_path, "latest", commit_oid);
-        create_tag(&repo_path, "release-1.0.0", commit_oid);
-        create_tag(&repo_path, "v1.0.0", commit_oid);
-        create_tag(&repo_path, "stable", commit_oid);
+        create_tag(&repo_path, "latest", &commit_oid);
+        create_tag(&repo_path, "release-1.0.0", &commit_oid);
+        create_tag(&repo_path, "v1.0.0", &commit_oid);
+        create_tag(&repo_path, "stable", &commit_oid);
 
         // Should find only v-prefixed tag when pattern is "v*"
         let result = resolve_commit_to_tag(&repo_path, "HEAD", "v*");
@@ -1636,8 +1660,8 @@ mod tests {
         let commit_oid = create_commit(&repo_path, "Release commit");
 
         // Create both tag formats
-        create_tag(&repo_path, "v2.0.0", commit_oid);
-        create_tag(&repo_path, "cargo-fslabscli-2.29.1", commit_oid);
+        create_tag(&repo_path, "v2.0.0", &commit_oid);
+        create_tag(&repo_path, "cargo-fslabscli-2.29.1", &commit_oid);
 
         // When searching for "v*", should only return v-prefixed tag
         let result = resolve_commit_to_tag(&repo_path, "HEAD", "v*");
@@ -1660,8 +1684,8 @@ mod tests {
         let (_temp_dir, repo_path) = create_test_repo();
         let commit_oid = create_commit(&repo_path, "Tagged commit");
 
-        create_tag(&repo_path, "latest", commit_oid);
-        create_tag(&repo_path, "stable", commit_oid);
+        create_tag(&repo_path, "latest", &commit_oid);
+        create_tag(&repo_path, "stable", &commit_oid);
 
         // Try to find v* tags when only "latest" and "stable" exist
         let result = resolve_commit_to_tag(&repo_path, "HEAD", "v*");
@@ -1706,7 +1730,7 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         // Should contain error about resolving the reference
         assert!(
-            err_msg.contains("Failed to resolve git reference"),
+            err_msg.contains("No tag matching pattern"),
             "Error message should indicate failure, got: {}",
             err_msg
         );
@@ -1717,10 +1741,9 @@ mod tests {
         // Test: Should be able to resolve using a commit SHA directly
         let (_temp_dir, repo_path) = create_test_repo();
         let commit_oid = create_commit(&repo_path, "Feature commit");
-        create_tag(&repo_path, "v3.0.0", commit_oid);
+        create_tag(&repo_path, "v3.0.0", &commit_oid);
 
-        let commit_sha = commit_oid.to_string();
-        let result = resolve_commit_to_tag(&repo_path, &commit_sha, "v*");
+        let result = resolve_commit_to_tag(&repo_path, &commit_oid, "v*");
         assert!(result.is_ok(), "Should resolve commit SHA to tag");
         assert_eq!(result.unwrap(), "v3.0.0");
     }
@@ -1730,10 +1753,9 @@ mod tests {
         // Test: Should be able to resolve using a short commit SHA
         let (_temp_dir, repo_path) = create_test_repo();
         let commit_oid = create_commit(&repo_path, "Short SHA test");
-        create_tag(&repo_path, "v4.0.0", commit_oid);
+        create_tag(&repo_path, "v4.0.0", &commit_oid);
 
-        let commit_sha = commit_oid.to_string();
-        let short_sha = &commit_sha[..7]; // Use first 7 characters
+        let short_sha = &commit_oid[..7]; // Use first 7 characters
         let result = resolve_commit_to_tag(&repo_path, short_sha, "v*");
         assert!(result.is_ok(), "Should resolve short commit SHA to tag");
         assert_eq!(result.unwrap(), "v4.0.0");
@@ -1744,7 +1766,7 @@ mod tests {
         // Test: Should resolve HEAD reference to tag
         let (_temp_dir, repo_path) = create_test_repo();
         let commit_oid = create_commit(&repo_path, "HEAD commit");
-        create_tag(&repo_path, "v5.0.0", commit_oid);
+        create_tag(&repo_path, "v5.0.0", &commit_oid);
 
         let result = resolve_commit_to_tag(&repo_path, "HEAD", "v*");
         assert!(result.is_ok(), "Should resolve HEAD to tag");
@@ -1755,16 +1777,18 @@ mod tests {
     fn test_resolve_branch_reference() {
         // Test: Should resolve a branch reference to tag
         let (_temp_dir, repo_path) = create_test_repo();
-        let repo = Repository::open(&repo_path).expect("Failed to open repository");
 
         // Create a commit and tag it
         let commit_oid = create_commit(&repo_path, "Branch commit");
-        create_tag(&repo_path, "v6.0.0", commit_oid);
+        create_tag(&repo_path, "v6.0.0", &commit_oid);
 
         // Create a branch pointing to this commit
-        let commit = repo.find_commit(commit_oid).expect("Failed to find commit");
-        repo.branch("feature-branch", &commit, false)
+        let output = Command::new("git")
+            .args(["branch", "feature-branch", &commit_oid])
+            .current_dir(&repo_path)
+            .output()
             .expect("Failed to create branch");
+        assert!(output.status.success(), "git branch failed: {:?}", output);
 
         let result = resolve_commit_to_tag(&repo_path, "feature-branch", "v*");
         assert!(result.is_ok(), "Should resolve branch reference to tag");
@@ -1778,14 +1802,13 @@ mod tests {
 
         // Create first commit with tag
         let first_commit_oid = create_commit(&repo_path, "First release");
-        create_tag(&repo_path, "v1.0.0", first_commit_oid);
+        create_tag(&repo_path, "v1.0.0", &first_commit_oid);
 
         // Create second commit (HEAD) without tag
         create_commit(&repo_path, "Second commit");
 
         // Should still be able to resolve the first commit by its SHA
-        let commit_sha = first_commit_oid.to_string();
-        let result = resolve_commit_to_tag(&repo_path, &commit_sha, "v*");
+        let result = resolve_commit_to_tag(&repo_path, &first_commit_oid, "v*");
         assert!(result.is_ok(), "Should resolve older commit to tag");
         assert_eq!(result.unwrap(), "v1.0.0");
     }
@@ -1798,9 +1821,9 @@ mod tests {
         let commit_oid = create_commit(&repo_path, "Multi-version commit");
 
         // Create multiple tags
-        create_tag(&repo_path, "v1.0.0", commit_oid);
-        create_tag(&repo_path, "v2.0.0", commit_oid);
-        create_tag(&repo_path, "v1.0.1", commit_oid);
+        create_tag(&repo_path, "v1.0.0", &commit_oid);
+        create_tag(&repo_path, "v2.0.0", &commit_oid);
+        create_tag(&repo_path, "v1.0.1", &commit_oid);
 
         let result = resolve_commit_to_tag(&repo_path, "HEAD", "v*");
         assert!(result.is_ok(), "Should successfully resolve to tag");
@@ -1825,7 +1848,7 @@ mod tests {
 
         // First commit with tag
         let first_commit_oid = create_commit(&repo_path, "First release");
-        create_tag(&repo_path, "v1.0.0", first_commit_oid);
+        create_tag(&repo_path, "v1.0.0", &first_commit_oid);
 
         // Second commit (becomes HEAD)
         create_commit(&repo_path, "Second commit");
@@ -1840,17 +1863,18 @@ mod tests {
     fn test_annotated_tag_resolution() {
         // Test: Should resolve annotated tags (not just lightweight tags)
         let (_temp_dir, repo_path) = create_test_repo();
-        let repo = Repository::open(&repo_path).expect("Failed to open repository");
 
         let commit_oid = create_commit(&repo_path, "Annotated tag commit");
-        let commit = repo.find_commit(commit_oid).expect("Failed to find commit");
-        let obj = commit.as_object();
 
         // Create an annotated tag
-        let sig =
-            Signature::now("Test User", "test@example.com").expect("Failed to create signature");
-        repo.tag("v7.0.0", obj, &sig, "Release v7.0.0", false)
+        let output = Command::new("git")
+            .env("GIT_COMMITTER_NAME", "Test User")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .args(["tag", "-a", "v7.0.0", "-m", "Release v7.0.0", &commit_oid])
+            .current_dir(&repo_path)
+            .output()
             .expect("Failed to create annotated tag");
+        assert!(output.status.success(), "git tag failed: {:?}", output);
 
         let result = resolve_commit_to_tag(&repo_path, "HEAD", "v*");
         assert!(result.is_ok(), "Should resolve annotated tag");
@@ -1867,7 +1891,7 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("Failed to open git repository"),
+            err_msg.contains("Failed to run git describe"),
             "Error message should mention repository opening failure, got: {}",
             err_msg
         );

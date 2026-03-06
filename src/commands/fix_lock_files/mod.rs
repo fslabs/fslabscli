@@ -1,9 +1,10 @@
 use crate::{
-    PackageRelatedOptions, PrettyPrintable, crate_graph::CrateGraph, script::CommandOutput,
+    PackageRelatedOptions, PrettyPrintable,
+    crate_graph::{CrateGraph, FeatureResolution},
+    script::CommandOutput,
 };
 use clap::Parser;
 use diffy::create_patch;
-use git2::Repository;
 use std::path::Path;
 use tracing::{debug, info};
 
@@ -22,7 +23,7 @@ pub struct Options {
     /// The base revision spec used for checking `Cargo.lock` files.
     ///
     /// This can either be a git revision SHA or any other revision spec
-    /// supported by the `git2` crate. For example, a local branch name can be
+    /// supported by gix. For example, a local branch name can be
     /// given as "$branch_name", or a remote branch as "remote/$branch_name", as
     /// in "origin/main".
     ///
@@ -61,31 +62,25 @@ then you must manually specify that branch with `--base-rev`.";
 /// This function uses git's blob reading capabilities to access file content
 /// from a historical commit without modifying the working directory.
 fn read_file_from_commit(
-    repo: &Repository,
-    commit: &git2::Object,
+    repo: &gix::Repository,
+    commit_id: gix::ObjectId,
     file_path: &Path,
 ) -> anyhow::Result<Option<String>> {
-    // Convert the object to a commit
-    let commit = commit
-        .as_commit()
-        .ok_or_else(|| anyhow::anyhow!("Object is not a commit"))?;
-
+    let commit = repo.find_commit(commit_id)?;
     let tree = commit.tree()?;
 
-    // Try to get the tree entry for this path
-    match tree.get_path(file_path) {
-        Ok(entry) => {
-            // Get the blob object
-            let blob = repo.find_blob(entry.id())?;
+    let path_str = file_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Non-UTF8 path: {:?}", file_path))?;
 
-            // Convert blob content to string
-            let content = std::str::from_utf8(blob.content())?;
+    match tree.lookup_entry_by_path(path_str) {
+        Ok(Some(entry)) => {
+            let object = entry.object()?;
+            let blob = object.into_blob();
+            let content = std::str::from_utf8(blob.data.as_slice())?;
             Ok(Some(content.to_string()))
         }
-        Err(_) => {
-            // File doesn't exist at this commit
-            Ok(None)
-        }
+        Ok(None) | Err(_) => Ok(None),
     }
 }
 
@@ -117,28 +112,25 @@ pub fn fix_workspace_lockfile(
         }
     };
 
-    let repo = Repository::open(repo_root)?;
-    let base_commit = repo.revparse_single(base_revspec)?;
+    let repo = gix::open(repo_root)?;
+    let base_commit_id = repo.rev_parse_single(base_revspec)?.detach();
     // Restore `Cargo.lock` file to its state at `base_rev` using git blob reading
     // instead of checkout to avoid interfering with parallel tests.
-    debug!("Reading Cargo.lock from base commit {}", base_commit.id());
+    debug!("Reading Cargo.lock from base commit {}", base_commit_id);
 
     // Get relative path from repo root for git tree lookup
     let lock_path_relative = lock_path.strip_prefix(repo_root)?;
 
     // Read the lockfile content from base_commit without checking it out
-    let base_lockfile = read_file_from_commit(&repo, &base_commit, lock_path_relative)?;
+    let base_lockfile = read_file_from_commit(&repo, base_commit_id, lock_path_relative)?;
 
     if let Some(base_contents) = base_lockfile {
-        debug!(
-            "Restoring {lock_path:?} to contents at {}",
-            base_commit.id()
-        );
+        debug!("Restoring {lock_path:?} to contents at {}", base_commit_id);
         std::fs::write(&lock_path, base_contents)?;
     } else {
         debug!(
             "Cargo.lock did not exist at {}, removing if present",
-            base_commit.id()
+            base_commit_id
         );
         // If the file didn't exist at base_commit, remove it if it exists now
         let _ = std::fs::remove_file(&lock_path);
@@ -215,7 +207,12 @@ pub fn fix_lock_files(
     } = common_options;
     let Options { check, base_rev } = options;
 
-    let graph = CrateGraph::new(repo_root, cargo_main_registry.clone(), None)?;
+    let graph = CrateGraph::new(
+        repo_root,
+        cargo_main_registry.clone(),
+        None,
+        FeatureResolution::AllFeaturesOnly,
+    )?;
     let check_workspaces: Vec<_> = graph
         .workspaces()
         .iter()
@@ -232,7 +229,8 @@ pub fn fix_lock_files(
 #[cfg(test)]
 mod tests {
     use crate::utils::test::{
-        commit_all_changes, commit_repo, create_complex_workspace, modify_file, stage_file,
+        commit_all_changes, commit_repo, create_complex_workspace, init_repo, modify_file,
+        stage_file,
     };
 
     use super::*;
@@ -247,18 +245,7 @@ mod tests {
             .into_persistent()
             .to_path_buf();
 
-        let repo = Repository::init(&tmp).expect("Failed to init repo");
-
-        // Configure Git user info (required for commits)
-        repo.config()
-            .unwrap()
-            .set_str("user.name", "Test User")
-            .unwrap();
-        repo.config()
-            .unwrap()
-            .set_str("user.email", "test@example.com")
-            .unwrap();
-        repo.config().unwrap().set_str("gpg.sign", "false").unwrap();
+        init_repo(&tmp);
 
         Command::new("cargo")
             .arg("init")
@@ -439,7 +426,7 @@ version = "0.2.0"
     #[tokio::test]
     async fn test_fix_lockfile_updates_in_complex_ws() {
         let ws = create_complex_workspace(true);
-        let graph = CrateGraph::new(&ws, "", None).unwrap();
+        let graph = CrateGraph::new(&ws, "", None, FeatureResolution::AllFeaturesOnly).unwrap();
 
         // Remove lock files created from running cargo-metadata.
         for workspace in graph.workspaces() {
@@ -468,21 +455,16 @@ version = "0.2.0"
         // from git history without checking out the base commit, thus avoiding
         // interference with parallel tests and other files in the working directory.
         let repo_path = create_versioned_rust_crate();
-        let repo = Repository::open(&repo_path).expect("Failed to open repo");
 
-        // Get the initial commit SHA (HEAD~3 in this repo's history)
+        // Get the initial commit SHA (HEAD~3 in this repo's history) using git CLI
         let initial_commit_sha = {
-            let head = repo.head().unwrap();
-            let commit = head.peel_to_commit().unwrap();
-            // Walk back 3 commits to get the initial commit
-            let initial_commit = commit
-                .parent(0)
-                .unwrap()
-                .parent(0)
-                .unwrap()
-                .parent(0)
-                .unwrap();
-            initial_commit.id().to_string()
+            let output = Command::new("git")
+                .args(["rev-parse", "HEAD~3"])
+                .current_dir(&repo_path)
+                .output()
+                .expect("Failed to get HEAD~3 commit");
+            assert!(output.status.success(), "git rev-parse HEAD~3 failed");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
         };
 
         // Store the main.rs content before running the fix
@@ -552,21 +534,16 @@ version = "0.2.0"
         // file reads. With the new blob-reading approach, all tasks should succeed.
 
         let repo_path = create_versioned_rust_crate();
-        let repo = Repository::open(&repo_path).expect("Failed to open repo");
 
-        // Get the initial commit SHA (HEAD~3 in this repo's history)
+        // Get the initial commit SHA (HEAD~3 in this repo's history) using git CLI
         let initial_commit_sha = {
-            let head = repo.head().unwrap();
-            let commit = head.peel_to_commit().unwrap();
-            // Walk back 3 commits to get the initial commit
-            let initial_commit = commit
-                .parent(0)
-                .unwrap()
-                .parent(0)
-                .unwrap()
-                .parent(0)
-                .unwrap();
-            initial_commit.id().to_string()
+            let output = Command::new("git")
+                .args(["rev-parse", "HEAD~3"])
+                .current_dir(&repo_path)
+                .output()
+                .expect("Failed to get HEAD~3 commit");
+            assert!(output.status.success(), "git rev-parse HEAD~3 failed");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
         };
 
         let main_rs_path = repo_path.join("src/main.rs");

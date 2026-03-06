@@ -91,44 +91,6 @@ async fn has_cargo_nextest() -> bool {
     }
 }
 
-/// Count the number of test cases using `cargo nextest list`
-async fn count_nextest_tests(package_path: &PathBuf) -> usize {
-    use serde::Deserialize;
-
-    #[derive(Debug, Deserialize)]
-    struct NextestList {
-        #[serde(rename = "test-count")]
-        test_count: usize,
-    }
-
-    let output = tokio::process::Command::new("cargo")
-        .arg("nextest")
-        .arg("list")
-        .arg("--message-format")
-        .arg("json")
-        .current_dir(package_path)
-        .output()
-        .await;
-
-    let Ok(output) = output else {
-        return 0;
-    };
-
-    if !output.status.success() {
-        return 0;
-    }
-
-    let Ok(json_str) = String::from_utf8(output.stdout) else {
-        return 0;
-    };
-
-    // Parse the JSON output
-    match serde_json::from_str::<NextestList>(&json_str) {
-        Ok(list) => list.test_count,
-        Err(_) => 0,
-    }
-}
-
 #[derive(Debug, serde::Deserialize)]
 struct JUnitTestSuites {
     #[serde(rename = "testsuite", default)]
@@ -325,9 +287,110 @@ pub async fn tests(
     let semaphore = Arc::new(Semaphore::new(common_options.job_limit));
     let mut handles = vec![];
 
-    for (_, member) in results.members.into_iter().filter(|(_, member)| {
-        !member.test_detail.skip.unwrap_or_default() && (member.perform_test || options.run_all)
-    }) {
+    // Precompute transitive dependency counts for sorting and display.
+    let dep_graph = results.crate_graph.dependency_graph();
+    let transitive_dep_counts: HashMap<String, usize> = results
+        .members
+        .values()
+        .filter_map(|m| {
+            m.package_id.as_ref().map(|id| {
+                (
+                    m.package.clone(),
+                    dep_graph.get_transitive_dependencies(id.clone()).len(),
+                )
+            })
+        })
+        .collect();
+
+    // Sort members so directly changed crates run first (fail fast), then
+    // dependency-changed, then unchanged (only present with --run-all).
+    // Within each group, crates with more transitive dependencies run first
+    // (higher in the tree, more likely to surface issues), then alphabetically.
+    let mut members: Vec<_> = results
+        .members
+        .into_values()
+        .filter(|member| {
+            !member.test_detail.skip.unwrap_or_default() && (member.perform_test || options.run_all)
+        })
+        .collect();
+    members.sort_by(|a, b| {
+        let a_deps = transitive_dep_counts.get(&a.package).copied().unwrap_or(0);
+        let b_deps = transitive_dep_counts.get(&b.package).copied().unwrap_or(0);
+        b.changed
+            .cmp(&a.changed)
+            .then(b.dependencies_changed.cmp(&a.dependencies_changed))
+            .then(b_deps.cmp(&a_deps))
+            .then(a.package.cmp(&b.package))
+    });
+
+    // Print execution order grouped by change status.
+    {
+        let name_w = members
+            .iter()
+            .map(|m| m.package.len())
+            .max()
+            .unwrap_or(7)
+            .max(7);
+        let deps_w = 4; // "Deps" header
+        #[expect(clippy::type_complexity)]
+        let groups: &[(&str, Box<dyn Fn(&super::check_workspace::Result) -> bool>)] = &[
+            ("Directly changed", Box::new(|m| m.changed)),
+            (
+                "Dependency changed",
+                Box::new(|m| !m.changed && m.dependencies_changed),
+            ),
+            (
+                "Unchanged",
+                Box::new(|m| !m.changed && !m.dependencies_changed),
+            ),
+        ];
+        let active_groups: Vec<_> = groups
+            .iter()
+            .filter_map(|(label, pred)| {
+                let rows: Vec<_> = members.iter().filter(|m| pred(m)).collect();
+                if rows.is_empty() {
+                    None
+                } else {
+                    Some((*label, rows))
+                }
+            })
+            .collect();
+        if !active_groups.is_empty() {
+            // Column widths including padding: " content "
+            let nc = name_w + 2; // name column cell width
+            let dc = deps_w + 2; // deps column cell width
+            // Total width between outer box chars: nc + 1(│) + dc
+            let total = nc + 1 + dc;
+            let nb = "─".repeat(nc);
+            let db = "─".repeat(dc);
+            let fb = "─".repeat(total);
+            let mut table = String::new();
+            table.push_str(&format!("╭{fb}╮\n"));
+            for (i, (label, rows)) in active_groups.iter().enumerate() {
+                if i > 0 {
+                    table.push_str(&format!("├{nb}┴{db}┤\n"));
+                }
+                table.push_str(&format!("│ {:<w$}│\n", label, w = total - 1));
+                table.push_str(&format!("├{nb}┬{db}┤\n"));
+                table.push_str(&format!(
+                    "│ {:<name_w$} │ {:<deps_w$} │\n",
+                    "Package", "Deps"
+                ));
+                table.push_str(&format!("├{nb}┼{db}┤\n"));
+                for m in rows {
+                    let dep_count = transitive_dep_counts.get(&m.package).copied().unwrap_or(0);
+                    table.push_str(&format!(
+                        "│ {:<name_w$} │ {:<deps_w$} │\n",
+                        m.package, dep_count,
+                    ));
+                }
+            }
+            table.push_str(&format!("╰{nb}┴{db}╯"));
+            tracing::info!("Test execution order:\n{table}");
+        }
+    }
+
+    for member in members {
         let common_opts = Arc::new(common_options.clone());
         let base_revspec = options
             .diff
@@ -770,13 +833,7 @@ async fn do_test_on_package(
     })
     .collect();
 
-    // Count nextest subtests if available to adjust total step count
-    let nextest_subtest_count = if use_nextest {
-        count_nextest_tests(&package_path).await
-    } else {
-        0
-    };
-    let test_steps = fslabs_tests.len() + nextest_subtest_count;
+    let test_steps = fslabs_tests.len();
 
     for (mut i, fslabs_test) in fslabs_tests.into_iter().enumerate() {
         i += 1;
@@ -891,6 +948,20 @@ async fn do_test_on_package(
                         &tc_prefix,
                         duration.human(Truncate::Second)
                     );
+                    if !test_output.stderr.is_empty() {
+                        tracing::warn!(
+                            "│ {} │ stderr:\n{}",
+                            &tc_prefix,
+                            test_output.stderr.trim_end()
+                        );
+                    }
+                    if !test_output.stdout.is_empty() {
+                        tracing::warn!(
+                            "│ {} │ stdout:\n{}",
+                            &tc_prefix,
+                            test_output.stdout.trim_end()
+                        );
+                    }
                     status = "FAIL";
                     failed = !fslabs_test.optional; // fail all if not optional
                     TestCase::failure(
