@@ -263,6 +263,7 @@ pub async fn tests(
 
     let results =
         check_workspace::<Cargo>(common_options, &check_workspace_options, repo_root.clone())
+            .instrument(tracing::info_span!("check_workspace"))
             .await
             .map_err(|e| {
                 tracing::error!("Check directory for crates that need publishing: {}", e);

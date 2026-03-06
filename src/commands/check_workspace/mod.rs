@@ -884,12 +884,15 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
             true => Some(DependencyKind::Normal),
             false => None,
         };
-        let crates = CrateGraph::new(
-            &self.repo_root,
-            self.common_options.cargo_main_registry.clone(),
-            limit_dependency_kind,
-            FeatureResolution::DualGraph,
-        )?;
+        let crates = {
+            let _span = tracing::info_span!("resolve_workspaces").entered();
+            CrateGraph::new(
+                &self.repo_root,
+                self.common_options.cargo_main_registry.clone(),
+                limit_dependency_kind,
+                FeatureResolution::DualGraph,
+            )?
+        };
 
         let mut packages: HashMap<PackageId, Result> = HashMap::new();
         let mut dep_to_id: HashMap<String, PackageId> = HashMap::new();
@@ -902,6 +905,7 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
             );
         }
 
+        let _resolve_packages_span = tracing::info_span!("resolve_packages").entered();
         let whitelist: Vec<String> = self
             .common_options
             .whitelist
@@ -960,6 +964,7 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
         }
 
         let package_keys: Vec<PackageId> = packages.keys().cloned().collect();
+        drop(_resolve_packages_span);
 
         // 5. Compute Runtime information
         if self.common_options.progress {
@@ -976,6 +981,7 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
                 ProgressStyle::with_template("{spinner} {wide_msg} {pos}/{len}")?,
             ));
         }
+        let _compute_runtime_span = tracing::info_span!("compute_runtime_info").entered();
         let mut package_versions: HashMap<PackageId, String> = HashMap::new();
         package_versions.extend(packages.iter().map(|(k, v)| (k.clone(), v.version.clone())));
         for package_key in package_keys.clone() {
@@ -1000,6 +1006,8 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
             }
         }
 
+        drop(_compute_runtime_span);
+
         // Backfeed publishing based on alt_registries and whitelisting
         // If whitelisted package A needs to be published to a cargo registry, all of its dependencies should be as well
         if self.common_options.progress {
@@ -1016,6 +1024,7 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
             ));
         }
 
+        let _backfeed_span = tracing::info_span!("backfeed_publishing").entered();
         let mut all_packages_registries: HashSet<String> = HashSet::new();
         for package_key in package_keys.clone() {
             if let Some(package) = packages.get(&package_key) {
@@ -1062,6 +1071,8 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
                 }
             }
         }
+        drop(_backfeed_span);
+
         // Check Publich status
         if self.common_options.progress {
             println!(
@@ -1070,6 +1081,7 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
                 PAPER
             );
         }
+        let _check_published_span = tracing::info_span!("check_published_status").entered();
         let npm = Npm::new(
             self.options.npm_registry_url.clone(),
             self.options.npm_registry_token.clone(),
@@ -1181,6 +1193,8 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
             }
         }
 
+        drop(_check_published_span);
+
         if self.common_options.progress {
             println!(
                 "{} {}Resolving packages dependencies...",
@@ -1194,6 +1208,7 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
                 ProgressStyle::with_template("{spinner} {wide_msg} {pos}/{len}")?,
             ));
         }
+        let _resolve_deps_span = tracing::info_span!("resolve_dependencies").entered();
         let publish_status: HashMap<PackageId, bool> = packages
             .clone()
             .into_iter()
@@ -1225,6 +1240,8 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
         let package_keys: Vec<PackageId> = packages.keys().cloned().collect();
         tracing::debug!("Package list: {package_keys:#?}");
 
+        drop(_resolve_deps_span);
+
         if self.common_options.progress {
             println!(
                 "{} {}Checking if needs testing...",
@@ -1233,6 +1250,7 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
             );
         }
 
+        let _check_changed_span = tracing::info_span!("check_changed").entered();
         let diff_strategy = self.options.diff.strategy();
         if self.options.check_changed && diff_strategy != DiffStrategy::All {
             if self.common_options.progress {
@@ -1299,6 +1317,8 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
                 }
             }
         }
+        drop(_check_changed_span);
+
         if self.common_options.progress {
             println!("{} Done in {}", SPARKLE, HumanDuration(started.elapsed()));
         }
