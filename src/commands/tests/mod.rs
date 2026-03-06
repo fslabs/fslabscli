@@ -847,6 +847,20 @@ async fn do_test_on_package(
                         &tc_prefix,
                         duration.human(Truncate::Second)
                     );
+                    if !test_output.stderr.is_empty() {
+                        tracing::warn!(
+                            "│ {} │ stderr:\n{}",
+                            &tc_prefix,
+                            test_output.stderr.trim_end()
+                        );
+                    }
+                    if !test_output.stdout.is_empty() {
+                        tracing::warn!(
+                            "│ {} │ stdout:\n{}",
+                            &tc_prefix,
+                            test_output.stdout.trim_end()
+                        );
+                    }
                     status = "FAIL";
                     failed = !fslabs_test.optional; // fail all if not optional
                     TestCase::failure(
