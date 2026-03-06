@@ -20,6 +20,7 @@ use crate::commands::generate_workflow::{Options as GenerateWorkflowOptions, gen
 use crate::commands::github_app_token::{Options as GithubAppTokenOptions, github_app_token};
 use crate::commands::publish::{Options as PublishOptions, publish};
 use crate::commands::summaries::{Options as SummariesOptions, summaries};
+use crate::commands::sync_repos::{Options as SyncReposOptions, sync_repos};
 use crate::commands::tests::{Options as TestsOptions, tests};
 use crate::crate_graph::find_git_root;
 
@@ -117,6 +118,8 @@ enum Commands {
     GithubAppToken(Box<GithubAppTokenOptions>),
     /// Build and push docker image
     DockerBuildPush(Box<DockerBuildPushOptions>),
+    /// Sync fdk_apps workspace into a downstream repo
+    SyncRepos(Box<SyncReposOptions>),
 
     // Packages Related Commands
     //
@@ -471,6 +474,9 @@ async fn run() -> anyhow::Result<String> {
             .await
             .map(|r| display_results(cli.json, cli.pretty_print, r)),
         Commands::DockerBuildPush(options) => docker_build_push(options, working_directory)
+            .await
+            .map(|r| display_results(cli.json, cli.pretty_print, r)),
+        Commands::SyncRepos(options) => sync_repos(options, working_directory)
             .await
             .map(|r| display_results(cli.json, cli.pretty_print, r)),
         Commands::FixLockFiles {
