@@ -19,6 +19,7 @@ use std::{
     path::PathBuf,
     sync::Arc,
 };
+use tokio::sync::OnceCell;
 use tokio::sync::Semaphore;
 use tracing::Instrument;
 
@@ -393,6 +394,8 @@ pub async fn tests(
         }
     }
 
+    let lock_check_cache: LockCheckCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
     for member in members {
         let common_opts = Arc::new(common_options.clone());
         let base_revspec = options
@@ -408,6 +411,7 @@ pub async fn tests(
                 member,
                 metrics.clone(),
                 semaphore.clone(),
+                lock_check_cache.clone(),
             )
             .instrument(tracing::Span::current()),
         );
@@ -478,6 +482,17 @@ struct Metrics {
     common_member_counter: Counter<u64>,
 }
 
+/// Per-workspace cache for the `cargo_lock` check so it runs once per workspace
+/// rather than once per package.
+type LockCheckCache = Arc<tokio::sync::Mutex<HashMap<PathBuf, Arc<OnceCell<LockCheckResult>>>>>;
+
+#[derive(Clone)]
+struct LockCheckResult {
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
 async fn do_test_on_package(
     common_options: Arc<PackageRelatedOptions>,
     repo_root: PathBuf,
@@ -485,10 +500,19 @@ async fn do_test_on_package(
     member: super::check_workspace::Result,
     metrics: Metrics,
     semaphore: Arc<Semaphore>,
+    lock_check_cache: LockCheckCache,
 ) -> (bool, Report) {
     let permit = semaphore.acquire().await;
 
-    let result = run_package_tests(common_options, repo_root, base_revspec, member, metrics).await;
+    let result = run_package_tests(
+        common_options,
+        repo_root,
+        base_revspec,
+        member,
+        metrics,
+        lock_check_cache,
+    )
+    .await;
     drop(permit);
     result
 }
@@ -510,6 +534,7 @@ async fn run_package_tests(
     base_revspec: String,
     member: super::check_workspace::Result,
     metrics: Metrics,
+    lock_check_cache: LockCheckCache,
 ) -> (bool, Report) {
     let mut junit_report = ReportBuilder::new().build();
     let mut failed = false;
@@ -947,8 +972,34 @@ async fn run_package_tests(
             let test_output = match fslabs_test.id == "cargo_lock" {
                 true => {
                     let workspace_path = repo_root.join(&member.workspace);
-                    fix_workspace_lockfile(&repo_root, &workspace_path, &base_revspec, true)
-                        .unwrap_or_else(|e| e.into())
+                    let cell = {
+                        let mut cache = lock_check_cache.lock().await;
+                        cache
+                            .entry(workspace_path.clone())
+                            .or_insert_with(|| Arc::new(OnceCell::new()))
+                            .clone()
+                    };
+                    let result = cell
+                        .get_or_init(|| async {
+                            let r = fix_workspace_lockfile(
+                                &repo_root,
+                                &workspace_path,
+                                &base_revspec,
+                                true,
+                            )
+                            .unwrap_or_else(|e| e.into());
+                            LockCheckResult {
+                                success: r.success,
+                                stdout: r.stdout,
+                                stderr: r.stderr,
+                            }
+                        })
+                        .await;
+                    CommandOutput {
+                        success: result.success,
+                        stdout: result.stdout.clone(),
+                        stderr: result.stderr.clone(),
+                    }
                 }
 
                 false => {
