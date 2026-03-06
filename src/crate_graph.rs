@@ -104,11 +104,6 @@ impl CrateGraph {
         }
 
         let manifest_path = dir.join("Cargo.toml");
-        let lock_path = dir.join("Cargo.lock");
-        let orig_lock_content = match std::fs::exists(&lock_path)? {
-            true => Some(std::fs::read_to_string(&lock_path)?),
-            false => None,
-        };
 
         if std::fs::exists(&manifest_path)? {
             // Found a manifest. Get metadata with all features.
@@ -136,15 +131,32 @@ impl CrateGraph {
             } else {
                 !metadata.workspace_members.is_empty()
             };
-            workspaces.push(Workspace {
-                path: relative_path(repo_root, dir)
-                    .expect("Subdirectory must have ancestor path prefix")
-                    .into(),
-                metadata,
-                default_metadata,
-            });
-            // crate_graph runs `cargo metadata` under the hood. This can updates the Cargo.lock
-            // we want to track that behavior
+            // Use the actual workspace root from cargo metadata, not the
+            // directory we found the manifest in. A crate that is a member of
+            // a parent workspace will report the parent as workspace_root;
+            // using `dir` would create a workspace entry at the wrong path
+            // (e.g. pointing at a member's deleted Cargo.lock instead of the
+            // root workspace's Cargo.lock).
+            let ws_root = metadata.workspace_root.as_std_path();
+            let ws_path: PathBuf = relative_path(repo_root, ws_root)
+                .expect("Workspace root must be within the repo root")
+                .into();
+            // Save/restore the workspace root's Cargo.lock, since
+            // `cargo metadata` may modify it as a side effect.
+            let lock_path = ws_root.join("Cargo.lock");
+            let orig_lock_content = match std::fs::exists(&lock_path)? {
+                true => Some(std::fs::read_to_string(&lock_path)?),
+                false => None,
+            };
+            if !workspaces.iter().any(|w| w.path == ws_path) {
+                workspaces.push(Workspace {
+                    path: ws_path,
+                    metadata,
+                    default_metadata,
+                });
+            }
+            // crate_graph runs `cargo metadata` under the hood. This can update the Cargo.lock;
+            // we want to revert that behavior.
             let updated_lock_content = match std::fs::exists(&lock_path)? {
                 true => Some(std::fs::read_to_string(&lock_path)?),
                 false => None,
