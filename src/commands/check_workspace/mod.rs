@@ -1246,12 +1246,12 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
             // Check changed from a git pov
             let changed_package_paths =
                 crates.changed_packages(&repo, base_commit_id, head_commit_id, &diff_strategy)?;
-            tracing::info!("Changed packages: {changed_package_paths:#?}");
+            tracing::debug!("Changed packages: {changed_package_paths:#?}");
             // Any packages that transitively depend on changed packages are also considered "changed".
             let changed_closure = crates
                 .default_dependency_graph()
                 .reverse_closure(changed_package_paths.iter().map(AsRef::as_ref));
-            tracing::info!("Changed closure: {changed_closure:#?}");
+            tracing::debug!("Changed closure: {changed_closure:#?}");
 
             for package_key in package_keys.clone() {
                 if let Some(ref pb) = pb {
