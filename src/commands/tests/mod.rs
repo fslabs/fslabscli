@@ -899,8 +899,11 @@ async fn do_test_on_package(
                     .await;
             }
             let test_output = match fslabs_test.id == "cargo_lock" {
-                true => fix_workspace_lockfile(&repo_root, &package_path, &base_revspec, true)
-                    .unwrap_or_else(|e| e.into()),
+                true => {
+                    let workspace_path = repo_root.join(&member.workspace);
+                    fix_workspace_lockfile(&repo_root, &workspace_path, &base_revspec, true)
+                        .unwrap_or_else(|e| e.into())
+                }
 
                 false => {
                     Script::new(&fslabs_test.command, true)
