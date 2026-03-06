@@ -24,3 +24,4 @@ result/
 # Credential and secret files
 *.credentials
 secrets.yaml
+perfetto-trace.json
