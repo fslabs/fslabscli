@@ -884,6 +884,7 @@ async fn run_package_tests(
         );
         if failed {
             tracing::info!("│ {} │ ⏭ SKIPPED", tc_prefix,);
+            step_span.record("otel.status_code", "OK");
 
             metrics.test_duration_h.record(
                 0.0,
@@ -970,7 +971,7 @@ async fn run_package_tests(
                 }
             }
 
-            tracing::Span::current().record(
+            step_span.record(
                 "otel.status_code",
                 if test_output.success { "OK" } else { "ERROR" },
             );

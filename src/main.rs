@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fmt::Display;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -32,8 +33,12 @@ use opentelemetry_sdk::{
     trace::SdkTracerProvider,
 };
 use serde::Serialize;
+use tracing::field::{Field, Visit};
 use tracing_core::Level;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::field::RecordFields;
+use tracing_subscriber::fmt::FormatFields;
+use tracing_subscriber::fmt::format::{DefaultFields, Writer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod cli_args;
@@ -231,6 +236,54 @@ fn init_logs() -> SdkLoggerProvider {
         .build()
 }
 
+/// Fields that are only useful for the OTLP exporter layer, not stderr.
+fn is_otel_only_field(name: &str) -> bool {
+    name.starts_with("otel.") || matches!(name, "workspace" | "package" | "version" | "step")
+}
+
+/// Wraps `DefaultFields` to strip OTLP-only fields from stderr fmt output.
+#[derive(Debug)]
+struct FilterOtelFields(DefaultFields);
+
+impl<'writer> FormatFields<'writer> for FilterOtelFields {
+    fn format_fields<R: RecordFields>(&self, writer: Writer<'writer>, fields: R) -> fmt::Result {
+        use tracing_subscriber::field::{MakeVisitor, VisitOutput};
+        let mut v = self.0.make_visitor(writer);
+        fields.record(&mut FilteringVisitor(&mut v));
+        v.finish()
+    }
+}
+
+struct FilteringVisitor<'a>(&'a mut dyn Visit);
+
+macro_rules! forward_if_not_otel {
+    ($method:ident, $ty:ty) => {
+        fn $method(&mut self, field: &Field, value: $ty) {
+            if !is_otel_only_field(field.name()) {
+                self.0.$method(field, value);
+            }
+        }
+    };
+}
+
+impl Visit for FilteringVisitor<'_> {
+    forward_if_not_otel!(record_debug, &dyn fmt::Debug);
+    forward_if_not_otel!(record_f64, f64);
+    forward_if_not_otel!(record_i64, i64);
+    forward_if_not_otel!(record_u64, u64);
+    forward_if_not_otel!(record_i128, i128);
+    forward_if_not_otel!(record_u128, u128);
+    forward_if_not_otel!(record_bool, bool);
+    forward_if_not_otel!(record_str, &str);
+    forward_if_not_otel!(record_bytes, &[u8]);
+
+    fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
+        if !is_otel_only_field(field.name()) {
+            self.0.record_error(field, value);
+        }
+    }
+}
+
 pub fn setup_logging(verbosity: u8) -> OtelGuard {
     let logging_level = match verbosity {
         0 => Level::ERROR,
@@ -254,7 +307,8 @@ pub fn setup_logging(verbosity: u8) -> OtelGuard {
     let otel_layer = OpenTelemetryTracingBridge::new(&log_provider);
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(io::stderr)
-        .compact();
+        .compact()
+        .fmt_fields(FilterOtelFields(DefaultFields::new()));
 
     let traces_provider = init_traces();
     let otel_tracer_layer =
