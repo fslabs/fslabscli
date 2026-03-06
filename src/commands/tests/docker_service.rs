@@ -73,7 +73,7 @@ impl DockerContainer {
             return Err(anyhow::anyhow!(command_output.stderr));
         }
         Ok(DockerProcess {
-            container_id: command_output.stdout,
+            container_id: command_output.stdout.trim().to_string(),
         })
     }
 }
@@ -87,14 +87,26 @@ impl DockerProcess {
     pub async fn teardown(self) {
         let Self { container_id } = self;
         let path = std::env::current_dir().unwrap();
-        Script::new(format!("docker stop {container_id}"), true)
+        let stop_output = Script::new(format!("docker stop {container_id}"), true)
             .current_dir(&path)
             .execute()
             .await;
-        Script::new(format!("docker rm {container_id}"), true)
+        if !stop_output.success {
+            tracing::warn!(
+                "docker stop {container_id} failed: {}",
+                stop_output.stderr.trim_end()
+            );
+        }
+        let rm_output = Script::new(format!("docker rm {container_id}"), true)
             .current_dir(&path)
             .execute()
             .await;
+        if !rm_output.success {
+            tracing::warn!(
+                "docker rm {container_id} failed: {}",
+                rm_output.stderr.trim_end()
+            );
+        }
     }
 }
 
