@@ -11,7 +11,7 @@ use opentelemetry::{
 use port_check::free_local_port;
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     fmt::{Display, Formatter},
     fs::{File, create_dir_all, remove_dir_all},
@@ -394,28 +394,137 @@ pub async fn tests(
         }
     }
 
+    // --- Batch compile phase ---
+    // Run cargo check/clippy/doc once per (workspace, additional_args)
+    // group instead of once per package. This avoids target-dir lock
+    // contention that serialises concurrent per-package cargo invocations
+    // when many packages share the same workspace.
+    let batched_packages: Arc<HashSet<String>> = {
+        // Group packages by (workspace, additional_args).
+        // Store (name, version) so we can use `name@version` for -p flags
+        // to disambiguate packages that exist at multiple versions (e.g.
+        // vendor baselines).
+        let mut batch_groups: HashMap<String, HashMap<String, Vec<(String, String)>>> =
+            HashMap::new();
+        for member in &members {
+            let args = member.test_detail.args.clone().unwrap_or_default();
+            batch_groups
+                .entry(member.workspace.clone())
+                .or_default()
+                .entry(args.additional_args.clone())
+                .or_default()
+                .push((member.package.clone(), member.version.clone()));
+        }
+
+        let mut batched = HashSet::new();
+        let jobs_flag = if common_options.inner_job_limit != 0 {
+            format!("--jobs {}", common_options.inner_job_limit)
+        } else {
+            String::new()
+        };
+
+        'batch: for (workspace, args_groups) in &batch_groups {
+            let ws_path = repo_root.join(workspace);
+            for (additional_args, packages) in args_groups {
+                if packages.len() <= 1 {
+                    // No benefit to batching a single package.
+                    continue;
+                }
+                // cargo fmt only accepts plain package names.
+                let fmt_flags: String = packages
+                    .iter()
+                    .map(|(name, _)| format!("-p {name}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                // cargo check/clippy/doc need name@version to
+                // disambiguate packages that exist at multiple versions
+                // (e.g. vendor baselines).
+                let pkg_flags: String = packages
+                    .iter()
+                    .map(|(name, ver)| format!("-p {name}@{ver}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
+                let steps: Vec<(&str, String, HashMap<String, String>)> = vec![
+                    (
+                        "batch_fmt",
+                        format!("cargo fmt --verbose {fmt_flags} -- --check"),
+                        HashMap::new(),
+                    ),
+                    (
+                        "batch_check",
+                        format!(
+                            "cargo check --all-targets {additional_args} {pkg_flags} {jobs_flag}"
+                        ),
+                        HashMap::new(),
+                    ),
+                    (
+                        "batch_clippy",
+                        format!(
+                            "cargo clippy --all-targets {additional_args} {pkg_flags} -- -D warnings"
+                        ),
+                        HashMap::new(),
+                    ),
+                    (
+                        "batch_doc",
+                        format!("cargo doc --no-deps {pkg_flags} {jobs_flag}"),
+                        HashMap::from([(
+                            "RUSTDOCFLAGS".to_string(),
+                            "-D warnings".to_string(),
+                        )]),
+                    ),
+                ];
+
+                for (id, command, envs) in &steps {
+                    tracing::info!(
+                        "Running {id} for {} packages in workspace {workspace}",
+                        packages.len()
+                    );
+                    let output = Script::new(command, true)
+                        .name(format!("{workspace}::{id}"))
+                        .current_dir(&ws_path)
+                        .envs(envs)
+                        .log_stdout(tracing::Level::DEBUG)
+                        .log_stderr(tracing::Level::DEBUG)
+                        .execute()
+                        .await;
+                    if !output.success {
+                        tracing::error!("{id} failed for workspace {workspace}");
+                        global_failed = true;
+                        break 'batch;
+                    }
+                }
+                batched.extend(packages.iter().map(|(name, _)| name.clone()));
+            }
+        }
+        Arc::new(batched)
+    };
+
     let lock_check_cache: LockCheckCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
-    for member in members {
-        let common_opts = Arc::new(common_options.clone());
-        let base_revspec = options
-            .diff
-            .base_sha
-            .clone()
-            .unwrap_or_else(|| "origin/main".into());
-        let task_handle = tokio::spawn(
-            do_test_on_package(
-                common_opts,
-                repo_root.clone(),
-                base_revspec,
-                member,
-                metrics.clone(),
-                semaphore.clone(),
-                lock_check_cache.clone(),
-            )
-            .instrument(tracing::Span::current()),
-        );
-        handles.push(task_handle);
+    if !global_failed {
+        for member in members {
+            let common_opts = Arc::new(common_options.clone());
+            let base_revspec = options
+                .diff
+                .base_sha
+                .clone()
+                .unwrap_or_else(|| "origin/main".into());
+            let task_handle = tokio::spawn(
+                do_test_on_package(
+                    common_opts,
+                    repo_root.clone(),
+                    base_revspec,
+                    member,
+                    metrics.clone(),
+                    semaphore.clone(),
+                    lock_check_cache.clone(),
+                    batched_packages.clone(),
+                )
+                .instrument(tracing::Span::current()),
+            );
+            handles.push(task_handle);
+        }
     }
 
     // using `select_all` to allow fast failure
@@ -501,6 +610,7 @@ async fn do_test_on_package(
     metrics: Metrics,
     semaphore: Arc<Semaphore>,
     lock_check_cache: LockCheckCache,
+    batched_packages: Arc<HashSet<String>>,
 ) -> (bool, Report) {
     let permit = semaphore.acquire().await;
 
@@ -511,6 +621,7 @@ async fn do_test_on_package(
         member,
         metrics,
         lock_check_cache,
+        batched_packages,
     )
     .await;
     drop(permit);
@@ -535,6 +646,7 @@ async fn run_package_tests(
     member: super::check_workspace::Result,
     metrics: Metrics,
     lock_check_cache: LockCheckCache,
+    batched_packages: Arc<HashSet<String>>,
 ) -> (bool, Report) {
     let mut junit_report = ReportBuilder::new().build();
     let mut failed = false;
@@ -880,6 +992,15 @@ async fn run_package_tests(
     .iter()
     .cloned()
     .map(|mut t| {
+        // Skip steps already handled by the workspace batch phase.
+        if batched_packages.contains(&*package_name)
+            && matches!(
+                t.id.as_str(),
+                "cargo_fmt" | "cargo_check" | "cargo_clippy" | "cargo_doc"
+            )
+        {
+            t.skip = true;
+        }
         // Let's check if the test need to be skip
         let skip_env = format!("SKIP_{}_TEST", t.id).to_uppercase();
         if let Ok(skip) = env::var(skip_env) {
