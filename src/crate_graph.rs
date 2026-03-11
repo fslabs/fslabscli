@@ -1363,4 +1363,62 @@ workspace_a__crates_b = {{ version = "0.1.0", path = "../crates_b", registry = "
             all_features_closure.len()
         );
     }
+
+    /// When a workspace has explicit members, subdirectories not covered by those members
+    /// should still be recursed into, so that independent sub-workspaces may be discovered.
+    #[test]
+    fn test_excluded_subworkspace_discovered_in_explicit_member_workspace() {
+        let tmp = assert_fs::TempDir::new()
+            .unwrap()
+            .into_persistent()
+            .to_path_buf();
+
+        init_repo(&tmp);
+
+        // Create a parent workspace with explicit members in "crates/*"
+        initialize_workspace(&tmp, "mono", vec!["app_a"], vec![], false);
+
+        // Add exclude for the sub-workspace so cargo doesn't complain
+        // about an unrelated manifest inside the workspace directory.
+        {
+            let cargo_toml = tmp.join("mono").join("Cargo.toml");
+            let content = std::fs::read_to_string(&cargo_toml).unwrap();
+            let content = content.replace(
+                "members = [\"crates/*\"]",
+                "members = [\"crates/*\"]\nexclude = [\"fdk_apps\"]",
+            );
+            std::fs::write(&cargo_toml, content).unwrap();
+        }
+
+        // Create an independent sub-workspace inside "mono/" that is
+        // excluded from the parent workspace (simulates the fdk_apps case).
+        let excluded_dir = tmp.join("mono").join("fdk_apps");
+        std::fs::create_dir_all(&excluded_dir).unwrap();
+        Command::new("cargo")
+            .arg("init")
+            .arg("--lib")
+            .arg("--name")
+            .arg("fdk_apps")
+            .arg("--registry")
+            .arg(FAKE_REGISTRY)
+            .current_dir(&excluded_dir)
+            .output()
+            .expect("Failed to create fdk_apps crate");
+
+        commit_all_changes(&tmp, "Initial commit");
+
+        let graph = CrateGraph::new(&tmp, "", None, FeatureResolution::AllFeaturesOnly).unwrap();
+        let workspaces = graph.workspaces();
+
+        let ws_paths: Vec<&Path> = workspaces.iter().map(|w| w.path.as_path()).collect();
+
+        assert!(
+            ws_paths.contains(&Path::new("mono")),
+            "parent workspace 'mono' should be discovered, got: {ws_paths:?}"
+        );
+        assert!(
+            ws_paths.contains(&Path::new("mono").join("fdk_apps").as_path()),
+            "excluded sub-workspace 'mono/fdk_apps' should be discovered, got: {ws_paths:?}"
+        );
+    }
 }
