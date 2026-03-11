@@ -828,7 +828,7 @@ async fn run_package_tests(
                 format!("{test_command} {additional_args}")
             } else if use_nextest {
                 format!(
-                    "cargo nextest run --all-targets {additional_args} --profile default --no-fail-fast --no-tests pass {}",
+                    "cargo nextest run --all-targets {additional_args} --profile default --no-fail-fast --no-tests=pass {}",
                     if common_options.inner_job_limit != 0 {
                         format!("--test-threads {}", common_options.inner_job_limit)
                     } else {
