@@ -148,6 +148,26 @@ impl CrateGraph {
                 true => Some(std::fs::read_to_string(&lock_path)?),
                 false => None,
             };
+            // Compute the set of top-level subdirectories covered by
+            // workspace members before metadata is moved into the
+            // Workspace struct.
+            let covered: Option<HashSet<PathBuf>> = if has_explicit_members {
+                let dir_str = dir.to_str().unwrap_or("");
+                Some(
+                    metadata
+                        .workspace_members
+                        .iter()
+                        .filter_map(|id| {
+                            let pkg = metadata.packages.iter().find(|p| &p.id == id)?;
+                            let pkg_dir = pkg.manifest_path.parent()?;
+                            let rel = pkg_dir.strip_prefix(dir_str).ok()?;
+                            rel.components().next().map(|c| dir.join(c.as_str()))
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            };
             if !workspaces.iter().any(|w| w.path == ws_path) {
                 workspaces.push(Workspace {
                     path: ws_path,
@@ -178,8 +198,23 @@ impl CrateGraph {
                 }
                 (None, None) => {} // Nothing to do
             };
-            // Assume that the workspace members are all we needed to find.
-            if has_explicit_members {
+            if let Some(covered) = covered {
+                // Recurse into subdirectories not covered by workspace
+                // members, so excluded sub-workspaces (e.g. fdk_apps) are
+                // still discovered.
+                for entry in std::fs::read_dir(dir)? {
+                    let entry = entry?;
+                    if entry.metadata()?.is_dir() && !covered.contains(&entry.path()) {
+                        Self::new_recursive(
+                            repo_root,
+                            ignore,
+                            &entry.path(),
+                            workspaces,
+                            envs,
+                            dual_graph,
+                        )?;
+                    }
+                }
                 return Ok(());
             }
         }
