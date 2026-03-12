@@ -423,6 +423,8 @@ pub async fn tests(
             String::new()
         };
 
+        let mut batch_junit_report = ReportBuilder::new().build();
+
         'batch: for (workspace, args_groups) in &batch_groups {
             let ws_path = repo_root.join(workspace);
             for (additional_args, packages) in args_groups {
@@ -468,18 +470,29 @@ pub async fn tests(
                     (
                         "batch_doc",
                         format!("cargo doc --no-deps {pkg_flags} {jobs_flag}"),
-                        HashMap::from([(
-                            "RUSTDOCFLAGS".to_string(),
-                            "-D warnings".to_string(),
-                        )]),
+                        HashMap::from([("RUSTDOCFLAGS".to_string(), "-D warnings".to_string())]),
                     ),
                 ];
 
+                let mut ts = TestSuiteBuilder::new(&format!("Batch {workspace}"))
+                    .set_timestamp(OffsetDateTime::now_utc())
+                    .build();
+
                 for (id, command, envs) in &steps {
-                    tracing::info!(
-                        "Running {id} for {} packages in workspace {workspace}",
-                        packages.len()
+                    let step_span = tracing::info_span!(
+                        "batch_step",
+                        otel.name = format!("batch_step: {workspace}::{id}"),
+                        otel.status_code = tracing::field::Empty,
+                        step = %id,
+                        workspace = %workspace,
                     );
+                    let _step_entered = step_span.enter();
+
+                    let tc_prefix = format!("{workspace:30.30} batch │ {command:50.50}",);
+
+                    tracing::info!("│ {} │ ► START ({} packages)", tc_prefix, packages.len());
+                    let start_time = OffsetDateTime::now_utc();
+
                     let output = Script::new(command, true)
                         .name(format!("{workspace}::{id}"))
                         .current_dir(&ws_path)
@@ -488,15 +501,84 @@ pub async fn tests(
                         .log_stderr(tracing::Level::DEBUG)
                         .execute()
                         .await;
+
+                    let end_time = OffsetDateTime::now_utc();
+                    let duration = end_time - start_time;
+
+                    let (status, tc) = if output.success {
+                        tracing::info!(
+                            "│ {} │ 🟢 PASS in {}",
+                            &tc_prefix,
+                            duration.human(Truncate::Second)
+                        );
+                        step_span.record("otel.status_code", "OK");
+                        ("PASS", TestCase::success(&tc_prefix, duration))
+                    } else {
+                        tracing::info!(
+                            "│ {} │ 🟥 FAIL in {}",
+                            &tc_prefix,
+                            duration.human(Truncate::Second)
+                        );
+                        if !output.stderr.is_empty() {
+                            tracing::warn!(
+                                "│ {} │ stderr:\n{}",
+                                &tc_prefix,
+                                output.stderr.trim_end()
+                            );
+                        }
+                        if !output.stdout.is_empty() {
+                            tracing::warn!(
+                                "│ {} │ stdout:\n{}",
+                                &tc_prefix,
+                                output.stdout.trim_end()
+                            );
+                        }
+                        step_span.record("otel.status_code", "ERROR");
+                        (
+                            "FAIL",
+                            TestCase::failure(&tc_prefix, duration, command, "required"),
+                        )
+                    };
+
+                    // Record per-step metrics for each package in the batch.
+                    for (pkg_name, pkg_version) in packages {
+                        metrics.test_duration_h.record(
+                            duration.as_seconds_f64(),
+                            &[
+                                KeyValue::new("workspace_name", workspace.clone()),
+                                KeyValue::new("package_name", pkg_name.clone()),
+                                KeyValue::new("package_version", pkg_version.clone()),
+                                KeyValue::new("test_command", command.clone()),
+                                KeyValue::new("status", status),
+                            ],
+                        );
+                        metrics.test_counter.add(
+                            1,
+                            &[
+                                KeyValue::new("workspace_name", workspace.clone()),
+                                KeyValue::new("package_name", pkg_name.clone()),
+                                KeyValue::new("package_version", pkg_version.clone()),
+                                KeyValue::new("test_command", command.clone()),
+                                KeyValue::new("status", status),
+                            ],
+                        );
+                    }
+
+                    ts.add_testcase(tc);
+
                     if !output.success {
-                        tracing::error!("{id} failed for workspace {workspace}");
                         global_failed = true;
+                        batch_junit_report.add_testsuite(ts);
+                        global_junit_report.add_testsuites(batch_junit_report.testsuites().clone());
                         break 'batch;
                     }
                 }
+
+                batch_junit_report.add_testsuite(ts);
                 batched.extend(packages.iter().map(|(name, _)| name.clone()));
             }
         }
+        global_junit_report.add_testsuites(batch_junit_report.testsuites().clone());
         Arc::new(batched)
     };
 
@@ -602,6 +684,7 @@ struct LockCheckResult {
     stderr: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn do_test_on_package(
     common_options: Arc<PackageRelatedOptions>,
     repo_root: PathBuf,
@@ -993,7 +1076,7 @@ async fn run_package_tests(
     .cloned()
     .map(|mut t| {
         // Skip steps already handled by the workspace batch phase.
-        if batched_packages.contains(&*package_name)
+        if batched_packages.contains(package_name)
             && matches!(
                 t.id.as_str(),
                 "cargo_fmt" | "cargo_check" | "cargo_clippy" | "cargo_doc"
