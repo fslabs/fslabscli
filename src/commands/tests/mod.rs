@@ -23,6 +23,14 @@ use tokio::sync::OnceCell;
 use tokio::sync::Semaphore;
 use tracing::Instrument;
 
+/// Checks whether a step should be skipped based on the env var `SKIP_{ID}_TEST` (uppercased).
+/// Returns `true` only when the env var is present and equals `"true"`.
+#[allow(dead_code)] // false positive: module is named `tests`
+fn should_skip_step(id: &str) -> bool {
+    let skip_env = format!("SKIP_{}_TEST", id).to_uppercase();
+    matches!(env::var(skip_env), Ok(v) if v == "true")
+}
+
 use crate::{
     PackageRelatedOptions, PrettyPrintable,
     cli_args::DiffOptions,
@@ -473,6 +481,11 @@ pub async fn tests(
                         HashMap::from([("RUSTDOCFLAGS".to_string(), "-D warnings".to_string())]),
                     ),
                 ];
+
+                let steps: Vec<_> = steps
+                    .into_iter()
+                    .filter(|(id, _, _)| !should_skip_step(id))
+                    .collect();
 
                 let mut ts = TestSuiteBuilder::new(&format!("Batch {workspace}"))
                     .set_timestamp(OffsetDateTime::now_utc())
@@ -1085,9 +1098,8 @@ async fn run_package_tests(
             t.skip = true;
         }
         // Let's check if the test need to be skip
-        let skip_env = format!("SKIP_{}_TEST", t.id).to_uppercase();
-        if let Ok(skip) = env::var(skip_env) {
-            t.skip = skip == "true";
+        if should_skip_step(&t.id) {
+            t.skip = true;
         }
         t
     })
@@ -1383,4 +1395,74 @@ async fn run_package_tests(
     metrics.common_member_counter.add(1, &attributes);
     tracing::Span::current().record("otel.status_code", if failed { "ERROR" } else { "OK" });
     (failed, junit_report)
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    /// Helper: sets an env var, runs the closure, then removes the var.
+    /// Keeps the unsafe surface small and centralised.
+    fn with_env_var(key: &str, value: &str, f: impl FnOnce()) {
+        unsafe { env::set_var(key, value) };
+        f();
+        unsafe { env::remove_var(key) };
+    }
+
+    /// Helper: ensures an env var is absent, runs the closure, then cleans up.
+    fn without_env_var(key: &str, f: impl FnOnce()) {
+        unsafe { env::remove_var(key) };
+        f();
+    }
+
+    #[test]
+    fn should_not_skip_when_env_var_is_absent() {
+        without_env_var("SKIP_MYFAKESTEP_TEST", || {
+            assert!(!should_skip_step("myfakestep"));
+        });
+    }
+
+    #[test]
+    fn should_skip_when_env_var_is_true() {
+        with_env_var("SKIP_SKIPME_TEST", "true", || {
+            assert!(should_skip_step("skipme"));
+        });
+    }
+
+    #[test]
+    fn should_not_skip_when_env_var_is_false() {
+        with_env_var("SKIP_KEEPME_TEST", "false", || {
+            assert!(!should_skip_step("keepme"));
+        });
+    }
+
+    #[test]
+    fn should_not_skip_when_env_var_is_other_value() {
+        with_env_var("SKIP_OTHERSTEP_TEST", "yes", || {
+            assert!(!should_skip_step("otherstep"));
+        });
+    }
+
+    #[test]
+    fn should_uppercase_step_id_for_env_var_lookup() {
+        // step id "cargo_fmt" should check "SKIP_CARGO_FMT_TEST"
+        with_env_var("SKIP_CARGO_FMT_TEST", "true", || {
+            assert!(should_skip_step("cargo_fmt"));
+        });
+    }
+
+    #[test]
+    fn should_handle_mixed_case_step_id() {
+        // step id "MyStep" should check "SKIP_MYSTEP_TEST"
+        with_env_var("SKIP_MYSTEP_TEST", "true", || {
+            assert!(should_skip_step("MyStep"));
+        });
+    }
+
+    #[test]
+    fn should_not_skip_when_env_var_is_empty_string() {
+        with_env_var("SKIP_EMPTYSTEP_TEST", "", || {
+            assert!(!should_skip_step("emptystep"));
+        });
+    }
 }

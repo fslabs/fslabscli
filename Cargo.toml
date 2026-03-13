@@ -6,7 +6,7 @@ license = "MIT OR Apache-2.0"
 name = "cargo-fslabscli"
 publish = ["fsl"]
 repository = "https://github.com/fslabs/fslabsci"
-version = "2.39.0"
+version = "2.40.0"
 
 [package.metadata.fslabs.publish.binary]
 name = "FSLABS Cli tool"
@@ -23,6 +23,7 @@ resolver = "2"
 members = [
     "crates/fsl_test_api",
 ]
+exclude = ["test_crates/wasm_example"]
 
 [features]
 alpha = []
