@@ -208,9 +208,13 @@ pub fn get_registry_env(registry_name: String) -> HashMap<String, String> {
     ]);
     let registry_prefix =
         format!("CARGO_REGISTRIES_{}", registry_name.replace("-", "_")).to_uppercase();
-    if let Ok(index) = get_env_or_log(format!("{registry_prefix}_INDEX")) {
-        envs.insert(format!("{registry_prefix}_INDEX"), index.clone());
-    }
+    let skip_git_vars = if let Ok(index) = get_env_or_log(format!("{registry_prefix}_INDEX")) {
+        let sparse = index.starts_with("sparse+");
+        envs.insert(format!("{registry_prefix}_INDEX"), index);
+        sparse
+    } else {
+        true
+    };
     if let Ok(token) = get_env_or_log(format!("{registry_prefix}_TOKEN")) {
         envs.insert(format!("{registry_prefix}_TOKEN"), token.clone());
         envs.insert("Authorization".to_string(), token.clone());
@@ -219,14 +223,16 @@ pub fn get_registry_env(registry_name: String) -> HashMap<String, String> {
             "cargo:token".to_string(),
         );
     }
-    if let Ok(user_agent) = get_env_or_log(format!("{registry_prefix}_USER_AGENT")) {
-        envs.insert("CARGO_HTTP_USER_AGENT".to_string(), user_agent.clone());
-    }
-    if let Ok(private_key) = get_env_or_log(format!("{registry_prefix}_PRIVATE_KEY")) {
-        envs.insert(
-            "GIT_SSH_COMMAND".to_string(),
-            format!("ssh -i {}", private_key.clone()),
-        );
+    if !skip_git_vars {
+        if let Ok(user_agent) = get_env_or_log(format!("{registry_prefix}_USER_AGENT")) {
+            envs.insert("CARGO_HTTP_USER_AGENT".to_string(), user_agent);
+        }
+        if let Ok(private_key) = get_env_or_log(format!("{registry_prefix}_PRIVATE_KEY")) {
+            envs.insert(
+                "GIT_SSH_COMMAND".to_string(),
+                format!("ssh -i {}", private_key),
+            );
+        }
     }
     envs
 }
