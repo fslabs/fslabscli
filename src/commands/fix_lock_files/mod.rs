@@ -84,6 +84,59 @@ fn read_file_from_commit(
     }
 }
 
+/// Sort `[[patch.unused]]` blocks in a lockfile string by name, then version.
+/// Cargo generates these in nondeterministic order, which causes spurious diffs.
+fn normalize_lockfile(content: &str) -> String {
+    let patch_header = "[[patch.unused]]";
+    let Some(first_patch) = content.find(patch_header) else {
+        return content.to_string();
+    };
+
+    let prefix = &content[..first_patch];
+    let patch_region = &content[first_patch..];
+
+    // Split into individual [[patch.unused]] blocks.
+    let mut blocks: Vec<&str> = Vec::new();
+    let mut rest = patch_region;
+    while let Some(pos) = rest[1..].find(patch_header) {
+        let pos = pos + 1;
+        blocks.push(rest[..pos].trim_end_matches('\n'));
+        rest = &rest[pos..];
+    }
+    blocks.push(rest.trim_end_matches('\n'));
+
+    blocks.sort_by(|a, b| {
+        fn sort_key(block: &str) -> (&str, &str) {
+            let name = block
+                .lines()
+                .find_map(|l| l.strip_prefix("name = "))
+                .unwrap_or("");
+            let version = block
+                .lines()
+                .find_map(|l| l.strip_prefix("version = "))
+                .unwrap_or("");
+            (name, version)
+        }
+        sort_key(a).cmp(&sort_key(b))
+    });
+
+    let mut result = prefix.to_string();
+    for (i, block) in blocks.iter().enumerate() {
+        result.push_str(block);
+        result.push('\n');
+        if i + 1 < blocks.len() {
+            result.push('\n');
+        }
+    }
+
+    // Preserve trailing newline if original had one.
+    if content.ends_with('\n') && !result.ends_with('\n') {
+        result.push('\n');
+    }
+
+    result
+}
+
 /// Fix mistakes in all workspace `Cargo.lock` files.
 ///
 /// Performs the following:
@@ -147,6 +200,16 @@ pub fn fix_workspace_lockfile(
         return Ok(output.into());
     }
 
+    // Normalize patch.unused ordering before writing the final lockfile,
+    // since cargo generates these in nondeterministic order.
+    if lock_path.exists() {
+        let content = std::fs::read_to_string(&lock_path)?;
+        let normalized = normalize_lockfile(&content);
+        if normalized != content {
+            std::fs::write(&lock_path, &normalized)?;
+        }
+    }
+
     if check {
         debug!("Checking for changes in {:?}", lock_path);
         let updated_lockfile = match std::fs::read_to_string(&lock_path) {
@@ -156,6 +219,7 @@ pub fn fix_workspace_lockfile(
                 return Err(e.into());
             }
         };
+        let orig_lockfile = orig_lockfile.map(|s| normalize_lockfile(&s));
         let changed = match (&orig_lockfile, &updated_lockfile) {
             (Some(orig), Some(updated)) => orig != updated,
             (Some(_), None) | (None, Some(_)) => true,
