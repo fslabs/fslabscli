@@ -1150,25 +1150,26 @@ async fn do_publish_package(params: DoPublishParams) -> PublishResult {
                 ));
             }
 
-            if let (Ok(user_agent), Ok(token)) = (
-                env::var(format!("{main_registry_prefix}_USER_AGENT")),
-                env::var(format!("{main_registry_prefix}_TOKEN")),
-            ) {
-                let user_agent_env = format!("{main_registry_prefix}_USER_AGENT");
+            if let Ok(token) = env::var(format!("{main_registry_prefix}_TOKEN")) {
                 let token_env = format!("{main_registry_prefix}_TOKEN");
                 let name_env = format!("{main_registry_prefix}_NAME");
-                envs.insert(user_agent_env.clone(), user_agent);
                 envs.insert(token_env.clone(), token);
                 envs.insert(name_env.clone(), common_options.cargo_main_registry.clone());
-                args.push(format!(
-                    "--secret id=cargo_private_registry_user_agent,env={user_agent_env}"
-                ));
                 args.push(format!(
                     "--secret id=cargo_private_registry_token,env={token_env}"
                 ));
                 args.push(format!(
                     "--secret id=cargo_private_registry_name,env={name_env}"
                 ));
+
+                // USER_AGENT is only set for git-based registries, not sparse ones (e.g. FSL)
+                if let Ok(user_agent) = env::var(format!("{main_registry_prefix}_USER_AGENT")) {
+                    let user_agent_env = format!("{main_registry_prefix}_USER_AGENT");
+                    envs.insert(user_agent_env.clone(), user_agent);
+                    args.push(format!(
+                        "--secret id=cargo_private_registry_user_agent,env={user_agent_env}"
+                    ));
+                }
             }
             args.push(context.clone());
             // First we build
