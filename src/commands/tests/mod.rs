@@ -477,7 +477,16 @@ pub async fn tests(
                     ),
                     (
                         "batch_doc",
-                        format!("cargo doc --no-deps {pkg_flags} {jobs_flag}"),
+                        // TODO: remove `+nightly ... -Z...` when stable rustdoc
+                        // isn't insanely slow anymore
+                        // see https://github.com/rust-lang/rust/issues/146895
+                        //
+                        // Paradoxically, we removed `--no-deps` to prevent an
+                        // issue where rustdoc just gets stuck on the last 10
+                        // packages and never makes progress.
+                        format!(
+                            "cargo +nightly doc -Zrustdoc-mergeable-info {pkg_flags} {jobs_flag}"
+                        ),
                         HashMap::from([("RUSTDOCFLAGS".to_string(), "-D warnings".to_string())]),
                     ),
                 ];
@@ -1019,8 +1028,15 @@ async fn run_package_tests(
         },
         FslabsTest {
             id: "cargo_doc".to_string(),
+            // TODO: remove `+nightly ... -Z...` when stable rustdoc
+            // isn't insanely slow anymore
+            // see https://github.com/rust-lang/rust/issues/146895
+            //
+            // Paradoxically, we removed `--no-deps` to prevent an
+            // issue where rustdoc just gets stuck on the last 10
+            // packages and never makes progress.
             command: format!(
-                "cargo doc --no-deps {}",
+                "cargo +nightly doc -Zrustdoc-mergeable-info {}",
                 if common_options.inner_job_limit != 0 {
                     format!("--jobs {}", common_options.inner_job_limit)
                 } else {
