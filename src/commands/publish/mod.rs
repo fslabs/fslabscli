@@ -1411,23 +1411,15 @@ pub async fn report_publish_to_github(
             Err(octocrab::Error::GitHub { source, .. })
                 if source.status_code == http::StatusCode::NOT_FOUND =>
             {
-                tracing::info!(
-                    "No existing release for tag {}, creating one",
-                    release_tag
-                );
+                tracing::info!("No existing release for tag {}, creating one", release_tag);
                 repo_releases
                     .create(&release_tag)
                     .send()
                     .await
-                    .with_context(|| {
-                        format!("Failed to create release for tag: {}", release_tag)
-                    })?
+                    .with_context(|| format!("Failed to create release for tag: {}", release_tag))?
             }
             Err(e) => {
-                return Err(e).context(format!(
-                    "Failed to fetch release for tag: {}",
-                    release_tag
-                ))
+                return Err(e).context(format!("Failed to fetch release for tag: {}", release_tag));
             }
         };
         let paths = fs::read_dir(artifact_dir)?;
