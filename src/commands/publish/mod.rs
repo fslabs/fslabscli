@@ -185,7 +185,7 @@ impl PublishResult {
                 ..Default::default()
             },
             nix_binary: PublishDetailResult {
-                name: format!("{crate_name}@{crate_version} nix build .#release"),
+                name: format!("{crate_name}@{crate_version} nix build .#release --fallback"),
                 key: "nix".to_string(),
                 should_publish: package.publish_detail.nix_binary.publish,
                 ..Default::default()
@@ -1051,7 +1051,7 @@ async fn do_publish_package(params: DoPublishParams) -> PublishResult {
                 }
             }
             if !is_failed {
-                let mut command_output = Script::new("nix build .#release", true)
+                let mut command_output = Script::new("nix build .#release --fallback", true)
                     .current_dir(&package_path)
                     .log_stdout(tracing::Level::INFO)
                     .log_stderr(tracing::Level::INFO)
