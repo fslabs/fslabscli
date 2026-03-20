@@ -1406,10 +1406,30 @@ pub async fn report_publish_to_github(
 
         let repo = octocrab.repos(&options.repo_owner, &options.repo_name);
         let repo_releases = repo.releases();
-        let release = repo_releases
-            .get_by_tag(&release_tag)
-            .await
-            .with_context(|| format!("Could not find a release with tag: {}", release_tag))?;
+        let release = match repo_releases.get_by_tag(&release_tag).await {
+            Ok(release) => release,
+            Err(octocrab::Error::GitHub { source, .. })
+                if source.status_code == http::StatusCode::NOT_FOUND =>
+            {
+                tracing::info!(
+                    "No existing release for tag {}, creating one",
+                    release_tag
+                );
+                repo_releases
+                    .create(&release_tag)
+                    .send()
+                    .await
+                    .with_context(|| {
+                        format!("Failed to create release for tag: {}", release_tag)
+                    })?
+            }
+            Err(e) => {
+                return Err(e).context(format!(
+                    "Failed to fetch release for tag: {}",
+                    release_tag
+                ))
+            }
+        };
         let paths = fs::read_dir(artifact_dir)?;
         for artifact in paths.flatten() {
             let artifact_path = artifact.path();
