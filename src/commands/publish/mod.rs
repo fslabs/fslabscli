@@ -856,71 +856,6 @@ async fn do_publish_package(params: DoPublishParams) -> PublishResult {
         }
         result.s3.end_time = Some(SystemTime::now());
     }
-    if !is_failed && package.publish_detail.nix_binary.publish {
-        result.nix_binary.start_time = Some(SystemTime::now());
-        if options.dry_run {
-            result.nix_binary.success = true;
-        } else {
-            if let (Ok(atticd_url), Ok(atticd_cache), Ok(atticd_token)) = (
-                env::var("ATTICD_URL"),
-                env::var("ATTICD_CACHE"),
-                env::var("ATTICD_TOKEN"),
-            ) {
-                info!("Login to atticd");
-                let command_output = Script::new(
-                    format!("attic login central {atticd_url}/ {atticd_token}"),
-                    false,
-                )
-                .current_dir(&repo_root)
-                .log_stdout(tracing::Level::DEBUG)
-                .log_stderr(tracing::Level::DEBUG)
-                .execute()
-                .await;
-                result.nix_binary.update_from_command(command_output);
-                is_failed = !result.nix_binary.success;
-                if !is_failed {
-                    let command_output =
-                        Script::new(format!("attic use central:{atticd_cache}"), true)
-                            .current_dir(&package_path)
-                            .log_stdout(tracing::Level::DEBUG)
-                            .log_stderr(tracing::Level::DEBUG)
-                            .execute()
-                            .await;
-                    result.nix_binary.update_from_command(command_output);
-                    is_failed = !result.nix_binary.success;
-                }
-            }
-            if !is_failed {
-                let mut command_output = Script::new("nix build .#release", true)
-                    .current_dir(&package_path)
-                    .log_stdout(tracing::Level::INFO)
-                    .log_stderr(tracing::Level::INFO)
-                    .execute()
-                    .await;
-                if command_output.success {
-                    // Let's copy the artifacts to the
-                    command_output.success =
-                        copy_files(&package_path.join("result/bin"), &output_dir).is_ok();
-                }
-                result.nix_binary.update_from_command(command_output);
-                is_failed = !result.nix_binary.success;
-            }
-            if !is_failed && let Ok(atticd_cache) = env::var("ATTICD_CACHE") {
-                // Let's push the store to cachix by rebuilding and pushing
-                info!("Pushing to atticd");
-                let command_output = Script::new(format!(
-                    "attic push {atticd_cache} $(nix-store -qR --include-outputs $(nix-store -qd ./result) | grep -v '\\.drv$')"
-                ), true)
-                    .current_dir(&package_path)
-                    .log_stdout(tracing::Level::INFO)
-                    .log_stderr(tracing::Level::INFO)
-                    .execute().await;
-                result.nix_binary.update_from_command(command_output);
-                is_failed = !result.nix_binary.success;
-            }
-        }
-        result.nix_binary.end_time = Some(SystemTime::now());
-    }
     if !is_failed && package.publish_detail.cargo.publish {
         let additional_args = package.publish_detail.additional_args.unwrap_or_default();
 
@@ -1080,6 +1015,71 @@ async fn do_publish_package(params: DoPublishParams) -> PublishResult {
                 result.cargo.insert(registry_name.clone(), r);
             }
         }
+    }
+    if !is_failed && package.publish_detail.nix_binary.publish {
+        result.nix_binary.start_time = Some(SystemTime::now());
+        if options.dry_run {
+            result.nix_binary.success = true;
+        } else {
+            if let (Ok(atticd_url), Ok(atticd_cache), Ok(atticd_token)) = (
+                env::var("ATTICD_URL"),
+                env::var("ATTICD_CACHE"),
+                env::var("ATTICD_TOKEN"),
+            ) {
+                info!("Login to atticd");
+                let command_output = Script::new(
+                    format!("attic login central {atticd_url}/ {atticd_token}"),
+                    false,
+                )
+                .current_dir(&repo_root)
+                .log_stdout(tracing::Level::DEBUG)
+                .log_stderr(tracing::Level::DEBUG)
+                .execute()
+                .await;
+                result.nix_binary.update_from_command(command_output);
+                is_failed = !result.nix_binary.success;
+                if !is_failed {
+                    let command_output =
+                        Script::new(format!("attic use central:{atticd_cache}"), true)
+                            .current_dir(&package_path)
+                            .log_stdout(tracing::Level::DEBUG)
+                            .log_stderr(tracing::Level::DEBUG)
+                            .execute()
+                            .await;
+                    result.nix_binary.update_from_command(command_output);
+                    is_failed = !result.nix_binary.success;
+                }
+            }
+            if !is_failed {
+                let mut command_output = Script::new("nix build .#release", true)
+                    .current_dir(&package_path)
+                    .log_stdout(tracing::Level::INFO)
+                    .log_stderr(tracing::Level::INFO)
+                    .execute()
+                    .await;
+                if command_output.success {
+                    // Let's copy the artifacts to the
+                    command_output.success =
+                        copy_files(&package_path.join("result/bin"), &output_dir).is_ok();
+                }
+                result.nix_binary.update_from_command(command_output);
+                is_failed = !result.nix_binary.success;
+            }
+            if !is_failed && let Ok(atticd_cache) = env::var("ATTICD_CACHE") {
+                // Let's push the store to cachix by rebuilding and pushing
+                info!("Pushing to atticd");
+                let command_output = Script::new(format!(
+                    "attic push {atticd_cache} $(nix-store -qR --include-outputs $(nix-store -qd ./result) | grep -v '\\.drv$')"
+                ), true)
+                    .current_dir(&package_path)
+                    .log_stdout(tracing::Level::INFO)
+                    .log_stderr(tracing::Level::INFO)
+                    .execute().await;
+                result.nix_binary.update_from_command(command_output);
+                is_failed = !result.nix_binary.success;
+            }
+        }
+        result.nix_binary.end_time = Some(SystemTime::now());
     }
     if !is_failed && package.publish_detail.docker.publish {
         result.docker.start_time = Some(SystemTime::now());
