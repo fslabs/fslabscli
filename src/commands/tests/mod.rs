@@ -433,8 +433,118 @@ pub async fn tests(
 
         let mut batch_junit_report = ReportBuilder::new().build();
 
+        let base_revspec_batch = options
+            .diff
+            .base_sha
+            .clone()
+            .unwrap_or_else(|| "origin/main".into());
+
         'batch: for (workspace, args_groups) in &batch_groups {
             let ws_path = repo_root.join(workspace);
+
+            // Run lock check once per workspace, before any cargo command
+            // that could modify the lock file as a side effect.
+            if !should_skip_step("cargo_lock") {
+                let lock_span = tracing::info_span!(
+                    "batch_step",
+                    otel.name = format!("batch_step: {workspace}::batch_lock"),
+                    otel.status_code = tracing::field::Empty,
+                    step = "batch_lock",
+                    workspace = %workspace,
+                );
+                let _lock_entered = lock_span.enter();
+
+                let all_packages: Vec<_> =
+                    args_groups.values().flat_map(|pkgs| pkgs.iter()).collect();
+                let tc_prefix = format!(
+                    "{workspace:30.30} batch │ {:50.50}",
+                    "fix-lock-files --check"
+                );
+
+                tracing::info!(
+                    "│ {} │ ► START ({} packages)",
+                    tc_prefix,
+                    all_packages.len()
+                );
+                let start_time = OffsetDateTime::now_utc();
+
+                let lock_result =
+                    fix_workspace_lockfile(&repo_root, &ws_path, &base_revspec_batch, true)
+                        .unwrap_or_else(|e| e.into());
+
+                let end_time = OffsetDateTime::now_utc();
+                let duration = end_time - start_time;
+
+                let mut ts = TestSuiteBuilder::new(&format!("Batch {workspace} lock"))
+                    .set_timestamp(start_time)
+                    .build();
+
+                let (status, tc) = if lock_result.success {
+                    tracing::info!(
+                        "│ {} │ 🟢 PASS in {}",
+                        &tc_prefix,
+                        duration.human(Truncate::Second)
+                    );
+                    lock_span.record("otel.status_code", "OK");
+                    ("PASS", TestCase::success(&tc_prefix, duration))
+                } else {
+                    tracing::info!(
+                        "│ {} │ 🟥 FAIL in {}",
+                        &tc_prefix,
+                        duration.human(Truncate::Second)
+                    );
+                    if !lock_result.stderr.is_empty() {
+                        tracing::warn!(
+                            "│ {} │ stderr:\n{}",
+                            &tc_prefix,
+                            lock_result.stderr.trim_end()
+                        );
+                    }
+                    lock_span.record("otel.status_code", "ERROR");
+                    (
+                        "FAIL",
+                        TestCase::failure(
+                            &tc_prefix,
+                            duration,
+                            "fix-lock-files --check",
+                            "required",
+                        ),
+                    )
+                };
+
+                for (pkg_name, pkg_version) in &all_packages {
+                    metrics.test_duration_h.record(
+                        duration.as_seconds_f64(),
+                        &[
+                            KeyValue::new("workspace_name", workspace.clone()),
+                            KeyValue::new("package_name", pkg_name.clone()),
+                            KeyValue::new("package_version", pkg_version.clone()),
+                            KeyValue::new("test_command", "fix-lock-files --check".to_string()),
+                            KeyValue::new("status", status),
+                        ],
+                    );
+                    metrics.test_counter.add(
+                        1,
+                        &[
+                            KeyValue::new("workspace_name", workspace.clone()),
+                            KeyValue::new("package_name", pkg_name.clone()),
+                            KeyValue::new("package_version", pkg_version.clone()),
+                            KeyValue::new("test_command", "fix-lock-files --check".to_string()),
+                            KeyValue::new("status", status),
+                        ],
+                    );
+                }
+
+                ts.add_testcase(tc);
+                batch_junit_report.add_testsuite(ts);
+
+                if !lock_result.success {
+                    global_failed = true;
+                    global_junit_report.add_testsuites(batch_junit_report.testsuites().clone());
+                    break 'batch;
+                }
+            }
+
             for (additional_args, packages) in args_groups {
                 if packages.len() <= 1 {
                     // No benefit to batching a single package.
@@ -1108,7 +1218,7 @@ async fn run_package_tests(
         if batched_packages.contains(package_name)
             && matches!(
                 t.id.as_str(),
-                "cargo_fmt" | "cargo_check" | "cargo_clippy" | "cargo_doc"
+                "cargo_fmt" | "cargo_lock" | "cargo_check" | "cargo_clippy" | "cargo_doc"
             )
         {
             t.skip = true;
