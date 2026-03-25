@@ -7,4 +7,5 @@ pub mod generate_workflow;
 pub mod github_app_token;
 pub mod publish;
 pub mod summaries;
+pub mod sync_repos;
 pub mod tests;
