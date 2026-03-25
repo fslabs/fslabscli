@@ -70,8 +70,12 @@ struct Cli {
     cargo_subcommand: CargoSubcommand,
     #[command(subcommand)]
     command: Commands,
+    /// Auto-update to the latest release on startup
     #[arg(env, long)]
     fslabscli_auto_update: bool,
+    /// Pin to a specific version (e.g. 2.42.0). Takes precedence over auto-update
+    #[arg(env, long)]
+    fslabscli_version: Option<String>,
 }
 
 #[derive(Debug, Parser, Clone, Default)]
@@ -384,12 +388,21 @@ async fn main() -> ExitCode {
 
     let guard = setup_logging(log_level);
 
+    let fslabscli_version = matches
+        .as_ref()
+        .and_then(|matches| matches.get_one::<String>("fslabscli_version").cloned());
+
     let fslabscli_auto_update = matches
         .and_then(|matches| matches.get_one::<bool>("fslabscli_auto_update").cloned())
         .unwrap_or_default();
 
-    if fslabscli_auto_update && let Err(err) = utils::auto_update::auto_update() {
-        println!("Error trying to update:{err:?}");
+    if let Some(version) = fslabscli_version {
+        if let Err(err) = utils::auto_update::auto_update(Some(&version)) {
+            eprintln!("Error trying to update to pinned version: {err:?}");
+            std::process::exit(1);
+        }
+    } else if fslabscli_auto_update && let Err(err) = utils::auto_update::auto_update(None) {
+        eprintln!("Error trying to update: {err:?}");
     }
 
     let r = run().await;
