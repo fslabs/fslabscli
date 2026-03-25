@@ -54,7 +54,38 @@ fn get_compatible_targets(detected_target: &str) -> Vec<String> {
     targets
 }
 
-pub fn auto_update() -> Result<(), Box<dyn error::Error>> {
+fn download_and_replace(
+    release_asset_download_url: &str,
+    from_version: &str,
+    to_version: &str,
+) -> Result<(), Box<dyn error::Error>> {
+    info!("Updating to version {to_version} (from {from_version}).");
+
+    let tmp_archive_dir = TempDir::new()?;
+    let tmp_archive_path_a = tmp_archive_dir.path().join("downloaded");
+    let tmp_archive_path_b = tmp_archive_dir.path().join("backup");
+    let mut tmp_archive = File::create(&tmp_archive_path_a)?;
+
+    let mut download = Download::from_url(release_asset_download_url);
+    download.set_header(header::ACCEPT, "application/octet-stream".parse().unwrap());
+    download.download_to(&mut tmp_archive)?;
+
+    std::fs::copy(&tmp_archive_path_a, &tmp_archive_path_b)?;
+    let current_exe = File::open(std::env::current_exe()?)?;
+    let permissions = current_exe.metadata()?.permissions();
+    let new_exe = File::open(&tmp_archive_path_b)?;
+    new_exe.set_permissions(permissions)?;
+
+    self_replace(&tmp_archive_path_a)?;
+
+    cargo_util::ProcessBuilder::new(tmp_archive_path_b)
+        .args(&std::env::args_os().skip(1).collect::<Vec<_>>())
+        .exec_replace()?;
+
+    Ok(())
+}
+
+pub fn auto_update(target_version: Option<&str>) -> Result<(), Box<dyn error::Error>> {
     let checker = self_update::backends::github::Update::configure()
         .repo_owner("fslabs")
         .repo_name("fslabscli")
@@ -62,59 +93,54 @@ pub fn auto_update() -> Result<(), Box<dyn error::Error>> {
         .current_version(cargo_crate_version!())
         .build()?;
 
-    // Find latest and current versions
-    let latest_release = checker.get_latest_release()?;
     let current_version = checker.current_version();
-    let latest_version = latest_release.version.split("-").last().unwrap();
+    let detected_target = checker.target();
+    let compatible_targets = get_compatible_targets(&detected_target);
 
-    if bump_is_greater(&current_version, latest_version).unwrap_or(false) {
-        // Get the list of compatible targets to search for
-        let detected_target = checker.target();
-        let compatible_targets = get_compatible_targets(&detected_target);
+    if let Some(version) = target_version {
+        let normalized = version.trim_start_matches('v');
 
-        // Find the correct release asset to download by checking all compatible targets
-        // We iterate through compatible targets in order of preference (detected first, then fallbacks)
-        let release_asset_for_arch = compatible_targets.iter().find_map(|target| {
-            latest_release
-                .assets
-                .iter()
-                .find(|a| a.name.contains(target))
-        });
+        if current_version == normalized {
+            return Ok(());
+        }
 
-        if let Some(release_asset) = release_asset_for_arch {
-            info!("Updating to version {latest_version} (from {current_version}).");
+        let release = checker
+            .get_release_version(&format!("v{normalized}"))
+            .map_err(|_| format!("Requested version {} not found in GitHub releases", version))?;
 
-            // Preparing temp files
-            let tmp_archive_dir = TempDir::new()?;
-            let tmp_archive_path_a = tmp_archive_dir.path().join("downloaded");
-            let tmp_archive_path_b = tmp_archive_dir.path().join("backup");
-            let mut tmp_archive = File::create(&tmp_archive_path_a)?;
+        let release_asset = compatible_targets
+            .iter()
+            .find_map(|target| release.assets.iter().find(|a| a.name.contains(target)));
 
-            // Downloading the latest release
-            let mut download = Download::from_url(&release_asset.download_url);
-            download.set_header(header::ACCEPT, "application/octet-stream".parse().unwrap());
-            download.download_to(&mut tmp_archive)?;
-
-            // Preparing a copy in temp folder with the correct permissions
-            std::fs::copy(&tmp_archive_path_a, &tmp_archive_path_b)?;
-            let current_exe = File::open(std::env::current_exe()?)?;
-            let permissions = current_exe.metadata()?.permissions();
-            let new_exe = File::open(&tmp_archive_path_b)?;
-            new_exe.set_permissions(permissions)?;
-
-            // Replace the current executable with the new one
-            self_replace(&tmp_archive_path_a)?;
-
-            // Run the new version from the temp copy
-            cargo_util::ProcessBuilder::new(tmp_archive_path_b)
-                .args(&std::env::args_os().skip(1).collect::<Vec<_>>())
-                .exec_replace()?;
-        } else {
+        let asset = release_asset.ok_or_else(|| {
             let tried_targets = compatible_targets.join(", ");
-            info!(
-                "Update available ({current_version} to {latest_version}), but no pre-built version found for any compatible architecture. Tried: {}",
-                tried_targets
-            );
+            format!(
+                "Version {} found but no pre-built binary for any compatible architecture. Tried: {}",
+                normalized, tried_targets
+            )
+        })?;
+        download_and_replace(&asset.download_url, &current_version, normalized)?;
+    } else {
+        let latest_release = checker.get_latest_release()?;
+        let latest_version = latest_release.version.split("-").last().unwrap();
+
+        if bump_is_greater(&current_version, latest_version).unwrap_or(false) {
+            let release_asset = compatible_targets.iter().find_map(|target| {
+                latest_release
+                    .assets
+                    .iter()
+                    .find(|a| a.name.contains(target))
+            });
+
+            if let Some(asset) = release_asset {
+                download_and_replace(&asset.download_url, &current_version, latest_version)?;
+            } else {
+                let tried_targets = compatible_targets.join(", ");
+                info!(
+                    "Update available ({current_version} to {latest_version}), but no pre-built version found for any compatible architecture. Tried: {}",
+                    tried_targets
+                );
+            }
         }
     }
 
