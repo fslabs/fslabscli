@@ -10,7 +10,7 @@ use opendal::{Operator, services};
 use regex::Regex;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::time::SystemTime;
 use std::{
     env,
@@ -25,6 +25,7 @@ use tracing::{debug, info};
 use walkdir::WalkDir;
 
 use crate::PackageRelatedOptions;
+use crate::commands::release_utils::{format_tag, upload_artifacts_to_release};
 use crate::script::{CommandOutput, Script};
 use crate::utils::get_registry_env;
 use crate::utils::github::{InstallationRetrievalMode, generate_github_app_token};
@@ -90,6 +91,18 @@ pub struct Options {
     /// Only use with registries that support overwrites (e.g., kellnr).
     #[arg(long, env, default_value = "false")]
     force_publish: bool,
+    /// Template string for git tag format.
+    /// Supports `{package_name}` and `{version}` as placeholders.
+    /// Example: `--tag-format "v{version}"` produces `v2.43.0`.
+    #[arg(long, env, default_value = "{package_name}-{version}")]
+    tag_format: String,
+    /// When set, target a draft GitHub release instead of a published one.
+    #[arg(long, env, default_value = "false")]
+    draft: bool,
+    /// Skip git tag resolution and use this tag directly.
+    /// Intended for Prow/CI invocations on push to main where no git tag exists yet.
+    #[arg(long, env)]
+    release_tag: Option<String>,
 }
 
 #[derive(Serialize, Default, Clone)]
@@ -1195,7 +1208,7 @@ async fn do_publish_package(params: DoPublishParams) -> PublishResult {
     if !is_failed && result.git_tag.should_publish {
         result.git_tag.start_time = Some(SystemTime::now());
         let tagged: anyhow::Result<()> = async {
-            let tag = format!("{}-{}", package.package, package.version);
+            let tag = format_tag(&options.tag_format, &package.package, &package.version);
             if let (Some(github_app_id), Some(github_app_private_key)) = (
                 options.github_app_id,
                 options.github_app_private_key.clone(),
@@ -1328,7 +1341,7 @@ pub async fn login(options: &Options, repo_root: &PathBuf) -> anyhow::Result<()>
 /// Uses git CLI's describe functionality for efficient exact-match tag lookup.
 /// Filters tags by the provided pattern (e.g., "v*" or "cargo-fslabscli-*")
 fn resolve_commit_to_tag(
-    repo_root: &PathBuf,
+    repo_root: &Path,
     commit_ref: &str,
     tag_pattern: &str,
 ) -> anyhow::Result<String> {
@@ -1361,8 +1374,8 @@ fn resolve_commit_to_tag(
 pub async fn report_publish_to_github(
     _common_options: &PackageRelatedOptions,
     options: &Options,
-    artifact_dir: &PathBuf,
-    repo_root: &PathBuf,
+    artifact_dir: &Path,
+    repo_root: &Path,
 ) -> anyhow::Result<()> {
     if let (Some(github_app_id), Some(github_app_private_key)) = (
         options.github_app_id,
@@ -1377,31 +1390,38 @@ pub async fn report_publish_to_github(
         .await?;
         let octocrab = Octocrab::builder().personal_token(github_token).build()?;
 
-        // Determine the release tag to upload artifacts to
-        // If base_rev is not set, use HEAD to find the most recent tag
-        let base_rev = options.base_rev.as_deref().unwrap_or("HEAD");
-
-        // Check if base_rev is already a tag name by trying to verify it exists as a tag
-        let repo = gix::open(repo_root)
-            .with_context(|| format!("Failed to open git repository at {:?}", repo_root))?;
-
-        let release_tag = if repo
-            .find_reference(&format!("refs/tags/{}", base_rev))
-            .is_ok()
-        {
-            // base_rev is already a valid tag name, use it directly
-            tracing::info!("Using {} as release tag (already a valid tag)", base_rev);
-            base_rev.to_string()
+        // Determine the release tag to upload artifacts to.
+        // --release-tag takes precedence; otherwise resolve from git history.
+        let release_tag = if let Some(explicit_tag) = &options.release_tag {
+            tracing::info!("Using explicit release tag: {}", explicit_tag);
+            explicit_tag.clone()
         } else {
-            // base_rev is a commit reference, resolve it to a tag
-            let resolved_tag = resolve_commit_to_tag(repo_root, base_rev, &options.tag_pattern)?;
-            tracing::info!(
-                "Resolved commit {} to tag: {} (pattern: {})",
-                base_rev,
-                resolved_tag,
-                options.tag_pattern
-            );
-            resolved_tag
+            // If base_rev is not set, use HEAD to find the most recent tag
+            let base_rev = options.base_rev.as_deref().unwrap_or("HEAD");
+
+            // Check if base_rev is already a tag name by trying to verify it exists as a tag
+            let repo = gix::open(repo_root)
+                .with_context(|| format!("Failed to open git repository at {:?}", repo_root))?;
+
+            if repo
+                .find_reference(&format!("refs/tags/{}", base_rev))
+                .is_ok()
+            {
+                // base_rev is already a valid tag name, use it directly
+                tracing::info!("Using {} as release tag (already a valid tag)", base_rev);
+                base_rev.to_string()
+            } else {
+                // base_rev is a commit reference, resolve it to a tag
+                let resolved_tag =
+                    resolve_commit_to_tag(repo_root, base_rev, &options.tag_pattern)?;
+                tracing::info!(
+                    "Resolved commit {} to tag: {} (pattern: {})",
+                    base_rev,
+                    resolved_tag,
+                    options.tag_pattern
+                );
+                resolved_tag
+            }
         };
 
         let repo = octocrab.repos(&options.repo_owner, &options.repo_name);
@@ -1411,37 +1431,68 @@ pub async fn report_publish_to_github(
             Err(octocrab::Error::GitHub { source, .. })
                 if source.status_code == http::StatusCode::NOT_FOUND =>
             {
-                tracing::info!("No existing release for tag {}, creating one", release_tag);
-                repo_releases
-                    .create(&release_tag)
-                    .send()
-                    .await
-                    .with_context(|| format!("Failed to create release for tag: {}", release_tag))?
+                if options.draft {
+                    // get_by_tag only returns published releases; drafts always 404 there.
+                    // List all releases (including drafts) and match by tag_name.
+                    tracing::info!("Looking for draft release with tag {}", release_tag);
+                    let first_page = repo_releases
+                        .list()
+                        .per_page(100)
+                        .send()
+                        .await
+                        .with_context(|| "Failed to list releases to find draft")?;
+                    let all_releases = octocrab
+                        .all_pages::<octocrab::models::repos::Release>(first_page)
+                        .await
+                        .with_context(|| "Failed to paginate releases to find draft")?;
+                    let existing_draft = all_releases
+                        .into_iter()
+                        .find(|r| r.draft && r.tag_name == release_tag);
+                    match existing_draft {
+                        Some(draft_release) => {
+                            tracing::info!(
+                                "Found existing draft release id={} for tag {}",
+                                draft_release.id,
+                                release_tag
+                            );
+                            draft_release
+                        }
+                        None => {
+                            tracing::info!(
+                                "No draft release found for tag {}, creating one",
+                                release_tag
+                            );
+                            repo_releases
+                                .create(&release_tag)
+                                .draft(true)
+                                .send()
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "Failed to create draft release for tag: {}",
+                                        release_tag
+                                    )
+                                })?
+                        }
+                    }
+                } else {
+                    tracing::info!("No existing release for tag {}, creating one", release_tag);
+                    repo_releases
+                        .create(&release_tag)
+                        .send()
+                        .await
+                        .with_context(|| {
+                            format!("Failed to create release for tag: {}", release_tag)
+                        })?
+                }
             }
             Err(e) => {
                 return Err(e).context(format!("Failed to fetch release for tag: {}", release_tag));
             }
         };
-        let paths = fs::read_dir(artifact_dir)?;
-        for artifact in paths.flatten() {
-            let artifact_path = artifact.path();
-            if let Some(artifact_name) = artifact_path.file_name()
-                && let Some(artifact_name) = artifact_name.to_str()
-            {
-                tracing::debug!("Uploading github artifact {:?}", artifact_name);
-                if let Ok(mut file) = File::open(&artifact_path)
-                    && let Ok(metadata) = fs::metadata(&artifact_path)
-                {
-                    let mut data: Vec<u8> = vec![0; metadata.len() as usize];
-                    if file.read(&mut data).is_ok() {
-                        let _ = repo_releases
-                            .upload_asset(release.id.into_inner(), artifact_name, data.into())
-                            .send()
-                            .await;
-                    }
-                }
-            }
-        }
+        upload_artifacts_to_release(&repo, release.id.into_inner(), artifact_dir)
+            .await
+            .with_context(|| format!("Failed to upload artifacts to release {}", release_tag))?;
     } else {
         tracing::debug!("Github credentials not set, not doing anything");
     }
@@ -1601,11 +1652,9 @@ pub async fn publish(
     futures::future::join_all(handles).await;
 
     // Report publish result to github
-    if let Err(e) =
-        report_publish_to_github(common_options, options, &artifact_dir, &repo_root).await
-    {
-        tracing::error!("Issue reporting to Github {:?}", e);
-    }
+    report_publish_to_github(common_options, options, &artifact_dir, &repo_root)
+        .await
+        .with_context(|| "Failed to report publish results to GitHub")?;
 
     let mut global_success = true;
     let mut published_members = HashMap::new();
@@ -2190,5 +2239,91 @@ mod tests {
             1,
             "Normal dep must always survive the publish filter"
         );
+    }
+
+    // --- format_tag tests ---
+
+    #[test]
+    fn test_format_tag_default_template() {
+        // Arrange
+        let template = "{package_name}-{version}";
+
+        // Act
+        let result = super::format_tag(template, "cargo-fslabscli", "2.43.0");
+
+        // Assert
+        assert_eq!(result, "cargo-fslabscli-2.43.0");
+    }
+
+    #[test]
+    fn test_format_tag_version_prefix() {
+        // Arrange
+        let template = "v{version}";
+
+        // Act
+        let result = super::format_tag(template, "cargo-fslabscli", "2.43.0");
+
+        // Assert
+        assert_eq!(result, "v2.43.0");
+    }
+
+    #[test]
+    fn test_format_tag_custom_prefix_with_v() {
+        // Arrange
+        let template = "{package_name}-v{version}";
+
+        // Act
+        let result = super::format_tag(template, "cargo-fslabscli", "2.43.0");
+
+        // Assert
+        assert_eq!(result, "cargo-fslabscli-v2.43.0");
+    }
+
+    #[test]
+    fn test_format_tag_no_placeholders() {
+        // Arrange
+        let template = "release-latest";
+
+        // Act
+        let result = super::format_tag(template, "cargo-fslabscli", "2.43.0");
+
+        // Assert
+        assert_eq!(result, "release-latest");
+    }
+
+    #[test]
+    fn test_format_tag_empty_package_name() {
+        // Arrange
+        let template = "{package_name}-{version}";
+
+        // Act
+        let result = super::format_tag(template, "", "2.43.0");
+
+        // Assert
+        assert_eq!(result, "-2.43.0");
+    }
+
+    #[test]
+    fn test_format_tag_empty_version() {
+        // Arrange
+        let template = "v{version}";
+
+        // Act
+        let result = super::format_tag(template, "cargo-fslabscli", "");
+
+        // Assert
+        assert_eq!(result, "v");
+    }
+
+    #[test]
+    fn test_format_tag_version_placeholder_repeated() {
+        // Arrange
+        let template = "{version}-{version}";
+
+        // Act
+        let result = super::format_tag(template, "cargo-fslabscli", "2.43.0");
+
+        // Assert
+        assert_eq!(result, "2.43.0-2.43.0");
     }
 }

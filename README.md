@@ -22,22 +22,25 @@ To install, run the following command:
 ## Release Process
 
 **Version source of truth:** `Cargo.toml`
-**Tag format:** `cargo-fslabscli-{version}` (e.g., `cargo-fslabscli-2.42.0`)
+**Tag format:** `v{version}` (e.g., `v2.43.0`) — configurable via `--tag-format`
 
 ### Steps
 
-1. **Bump version** — Update `version` in `Cargo.toml`, open a PR, merge to `main`. Label the PR appropriately (Features, Bug Fixes, Maintenance, Documentation) — PRs with `skip-changelog` label are excluded from release notes.
+1. **Bump version** — Update `version` in `Cargo.toml`, open a PR with appropriate labels, merge to `main`. PRs with `skip-changelog` are excluded from release notes. Changelog categories are controlled by [.github/release.yml](.github/release.yml).
 
-2. **Draft release auto-created** — On merge, the [Release Drafter](.github/workflows/release-drafter.yml) action creates or updates a draft GitHub Release tagged `cargo-fslabscli-{version}`. Changelog is generated from PR labels (config: [release-drafter.yaml](.github/release-drafter.yaml)).
+2. **Draft release auto-created** — On push to `main`, a Prow postsubmit runs `fslabscli draft-release`, which:
+   - Creates or updates a draft GitHub Release tagged `v{version}`
+   - Generates changelog from merged PRs (GitHub native release notes)
+   - Builds and uploads binary artifacts to the draft
+   - Pushes the Nix build to the cache
 
-3. **Publish the draft** — Review the draft release on GitHub. Click **"Publish release"** — this creates the git tag.
+3. **Publish the draft** — Review the draft release on GitHub, verify all assets are present, click **"Publish release"**. This creates the git tag and locks the release assets.
 
-4. **Prow builds and publishes** — Publishing triggers a webhook to Prow, which runs `publish-all`:
-   - Publishes crate to Cargo registr
-   - Builds Nix binary
-   - Uploads binary artifacts to the GitHub Release
-
-5. **Mark as latest** — Wait for Prow to finish uploading artifacts. **Do not mark as latest until all assets are available on the release.** Once verified, mark the release as **"latest"**.
+4. **Post-publish automation** — The new tag triggers Prow to:
+   - Publish the crate to the `fsl` Cargo registry
+   - Build and push the Docker image
+   - Mark the release as **"latest"**
+   - Kargo detects the new tag and starts canary promotion
 
 ### Flow
 
@@ -45,23 +48,25 @@ To install, run the following command:
 sequenceDiagram
     actor Dev as Developer
     participant GH as GitHub (main)
-    participant RD as Release Drafter Action
+    participant Prow as Prow (draft-release)
     participant Rel as GitHub Release
-    participant Prow as Prow (publish-all)
+    participant Prow2 as Prow (post-publish)
+    participant Kargo as Kargo
 
     Dev->>GH: Merge PR (version bump in Cargo.toml)
-    GH->>RD: Trigger on push to main
-    RD->>Rel: Create/update draft release<br/>tag: cargo-fslabscli-{version}<br/>changelog from PR labels
-
-    Dev->>Rel: Review draft, click "Publish release"
-    Note over Rel: Git tag created
-
-    Rel->>Prow: Webhook (release published)
-    Prow->>Prow: Publish crate to Cargo registry (fsl)
-    Prow->>Prow: Build Nix binary (--fallback)
-    Prow->>Prow: Push to Nix cache (atticd)
-    Prow->>Prow: Build & push Docker image
+    GH->>Prow: Postsubmit on push to main
+    Prow->>Prow: Build Nix binary, push to cache
+    Prow->>Rel: Create/update draft release<br/>tag: v{version}, changelog from PR labels
     Prow->>Rel: Upload binary artifacts
 
-    Dev->>Rel: Verify artifacts, mark as "latest"
+    Dev->>Rel: Review draft, verify assets, click "Publish release"
+    Note over Rel: Git tag created, assets locked
+
+    Rel->>Prow2: Webhook (tag created)
+    Prow2->>Prow2: Publish crate to fsl registry
+    Prow2->>Prow2: Build & push Docker image
+    Prow2->>Rel: Mark as "latest"
+
+    Rel->>Kargo: Tag detected
+    Kargo->>Kargo: Start canary promotion
 ```

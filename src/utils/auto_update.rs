@@ -85,6 +85,23 @@ fn download_and_replace(
     Ok(())
 }
 
+/// Extracts a bare semver string from a release tag name.
+///
+/// Supports the following formats:
+/// - `cargo-fslabscli-2.43.0` → `2.43.0`
+/// - `v2.43.0` → `2.43.0`
+/// - `cargo-fslabscli-v2.43.0` → `2.43.0`
+/// - `2.43.0` → `2.43.0`
+/// - `cargo-fslabscli-2.43.0-rc.1` → `2.43.0-rc.1`
+///
+/// The strategy: find the first ASCII digit — the version always starts there.
+fn extract_version_from_tag(tag: &str) -> &str {
+    match tag.find(|c: char| c.is_ascii_digit()) {
+        Some(pos) => &tag[pos..],
+        None => tag,
+    }
+}
+
 pub fn auto_update(target_version: Option<&str>) -> Result<(), Box<dyn error::Error>> {
     let checker = self_update::backends::github::Update::configure()
         .repo_owner("fslabs")
@@ -122,7 +139,7 @@ pub fn auto_update(target_version: Option<&str>) -> Result<(), Box<dyn error::Er
         download_and_replace(&asset.download_url, &current_version, normalized)?;
     } else {
         let latest_release = checker.get_latest_release()?;
-        let latest_version = latest_release.version.split("-").last().unwrap();
+        let latest_version = extract_version_from_tag(&latest_release.version);
 
         if bump_is_greater(&current_version, latest_version).unwrap_or(false) {
             let release_asset = compatible_targets.iter().find_map(|target| {
@@ -150,6 +167,42 @@ pub fn auto_update(target_version: Option<&str>) -> Result<(), Box<dyn error::Er
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extract_version_from_tag_v_prefix() {
+        assert_eq!(extract_version_from_tag("v2.43.0"), "2.43.0");
+    }
+
+    #[test]
+    fn test_extract_version_from_tag_package_prefix() {
+        assert_eq!(extract_version_from_tag("cargo-fslabscli-2.43.0"), "2.43.0");
+    }
+
+    #[test]
+    fn test_extract_version_from_tag_package_prefix_with_v() {
+        assert_eq!(
+            extract_version_from_tag("cargo-fslabscli-v2.43.0"),
+            "2.43.0"
+        );
+    }
+
+    #[test]
+    fn test_extract_version_from_tag_bare() {
+        assert_eq!(extract_version_from_tag("2.43.0"), "2.43.0");
+    }
+
+    #[test]
+    fn test_extract_version_from_tag_prerelease() {
+        assert_eq!(
+            extract_version_from_tag("cargo-fslabscli-2.43.0-rc.1"),
+            "2.43.0-rc.1"
+        );
+    }
+
+    #[test]
+    fn test_extract_version_from_tag_v_prerelease() {
+        assert_eq!(extract_version_from_tag("v2.43.0-rc.1"), "2.43.0-rc.1");
+    }
 
     #[test]
     fn test_get_compatible_targets_x86_64_gnu() {

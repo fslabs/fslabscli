@@ -14,6 +14,7 @@ use crate::commands::docker_build_push::{Options as DockerBuildPushOptions, dock
 use crate::commands::download_artifacts::{
     Options as DownloadArtifactsOptions, download_artifacts,
 };
+use crate::commands::draft_release::{Options as DraftReleaseOptions, draft_release};
 use crate::commands::fix_lock_files::{Options as FixLockFilesOptions, fix_lock_files};
 use crate::commands::generate_wix::{Options as GenerateWixOptions, generate_wix};
 use crate::commands::generate_workflow::{Options as GenerateWorkflowOptions, generate_workflow};
@@ -121,6 +122,8 @@ enum Commands {
     GithubAppToken(Box<GithubAppTokenOptions>),
     /// Build and push docker image
     DockerBuildPush(Box<DockerBuildPushOptions>),
+    /// Create or update a draft GitHub release and upload artifacts
+    DraftRelease(Box<DraftReleaseOptions>),
 
     // Packages Related Commands
     //
@@ -484,6 +487,9 @@ async fn run() -> anyhow::Result<String> {
             .await
             .map(|r| display_results(cli.json, cli.pretty_print, r)),
         Commands::DockerBuildPush(options) => docker_build_push(options, working_directory)
+            .await
+            .map(|r| display_results(cli.json, cli.pretty_print, r)),
+        Commands::DraftRelease(options) => draft_release(options, working_directory)
             .await
             .map(|r| display_results(cli.json, cli.pretty_print, r)),
         Commands::FixLockFiles {
