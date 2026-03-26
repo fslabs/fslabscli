@@ -1,0 +1,26 @@
+changelog:
+  categories:
+    - title: "🚀 Features"
+      labels:
+        - enhancement
+        - feature
+    - title: "🐛 Bug Fixes"
+      labels:
+        - bug
+        - bugfix
+        - fix
+    - title: "🧰 Maintenance"
+      labels:
+        - chore
+        - dependencies
+        - cleanup
+        - deprecated
+        - depreciation
+    - title: "📝 Documentation"
+      labels:
+        - documentation
+        - doc
+        - docs
+  exclude:
+    labels:
+      - skip-changelog
