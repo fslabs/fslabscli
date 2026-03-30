@@ -103,6 +103,21 @@ pub struct Options {
     /// Intended for Prow/CI invocations on push to main where no git tag exists yet.
     #[arg(long, env)]
     release_tag: Option<String>,
+    /// Override which publish steps to run, ignoring Cargo.toml metadata.
+    /// Can be repeated: --publish-steps nix --publish-steps cargo
+    /// When omitted, all steps enabled in Cargo.toml metadata run (current behavior).
+    #[arg(long, env, value_delimiter = ',')]
+    pub publish_steps: Option<Vec<PublishStep>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, clap::ValueEnum)]
+pub enum PublishStep {
+    S3,
+    Cargo,
+    Nix,
+    Docker,
+    Tags,
+    Github,
 }
 
 #[derive(Serialize, Default, Clone)]
@@ -657,6 +672,17 @@ struct DoPublishParams {
     member_paths: Arc<Vec<PathBuf>>,
 }
 
+/// Returns true if the given publish step should execute.
+///
+/// When `--publish-steps` is provided, only the explicitly listed steps run.
+/// When omitted, falls back to `metadata_enabled` (the Cargo.toml-derived value).
+fn should_run_step(options: &Options, step: PublishStep, metadata_enabled: bool) -> bool {
+    match &options.publish_steps {
+        Some(steps) => steps.contains(&step),
+        None => metadata_enabled,
+    }
+}
+
 /// Actual Publish
 async fn do_publish_package(params: DoPublishParams) -> PublishResult {
     let DoPublishParams {
@@ -680,7 +706,7 @@ async fn do_publish_package(params: DoPublishParams) -> PublishResult {
     let package_name = &package.package;
     let package_path = repo_root.join(&package.path);
     let mut is_failed = false;
-    if !is_failed && package.publish_detail.s3.publish {
+    if !is_failed && should_run_step(&options, PublishStep::S3, package.publish_detail.s3.publish) {
         result.s3.start_time = Some(SystemTime::now());
         if options.dry_run {
             result.s3.success = true;
@@ -869,7 +895,13 @@ async fn do_publish_package(params: DoPublishParams) -> PublishResult {
         }
         result.s3.end_time = Some(SystemTime::now());
     }
-    if !is_failed && package.publish_detail.cargo.publish {
+    if !is_failed
+        && should_run_step(
+            &options,
+            PublishStep::Cargo,
+            package.publish_detail.cargo.publish,
+        )
+    {
         let additional_args = package.publish_detail.additional_args.unwrap_or_default();
 
         if let Some(original_registry) = cargo.get_registry(&common_options.cargo_main_registry) {
@@ -1029,7 +1061,13 @@ async fn do_publish_package(params: DoPublishParams) -> PublishResult {
             }
         }
     }
-    if !is_failed && package.publish_detail.nix_binary.publish {
+    if !is_failed
+        && should_run_step(
+            &options,
+            PublishStep::Nix,
+            package.publish_detail.nix_binary.publish,
+        )
+    {
         result.nix_binary.start_time = Some(SystemTime::now());
         if options.dry_run {
             result.nix_binary.success = true;
@@ -1094,7 +1132,13 @@ async fn do_publish_package(params: DoPublishParams) -> PublishResult {
         }
         result.nix_binary.end_time = Some(SystemTime::now());
     }
-    if !is_failed && package.publish_detail.docker.publish {
+    if !is_failed
+        && should_run_step(
+            &options,
+            PublishStep::Docker,
+            package.publish_detail.docker.publish,
+        )
+    {
         result.docker.start_time = Some(SystemTime::now());
         if options.dry_run {
             result.docker.success = true;
@@ -1205,7 +1249,7 @@ async fn do_publish_package(params: DoPublishParams) -> PublishResult {
         }
         result.docker.end_time = Some(SystemTime::now());
     }
-    if !is_failed && result.git_tag.should_publish {
+    if !is_failed && should_run_step(&options, PublishStep::Tags, result.git_tag.should_publish) {
         result.git_tag.start_time = Some(SystemTime::now());
         let tagged: anyhow::Result<()> = async {
             let tag = format_tag(&options.tag_format, &package.package, &package.version);
@@ -1652,9 +1696,11 @@ pub async fn publish(
     futures::future::join_all(handles).await;
 
     // Report publish result to github
-    report_publish_to_github(common_options, options, &artifact_dir, &repo_root)
-        .await
-        .with_context(|| "Failed to report publish results to GitHub")?;
+    if should_run_step(options, PublishStep::Github, true) {
+        report_publish_to_github(common_options, options, &artifact_dir, &repo_root)
+            .await
+            .with_context(|| "Failed to report publish results to GitHub")?;
+    }
 
     let mut global_success = true;
     let mut published_members = HashMap::new();

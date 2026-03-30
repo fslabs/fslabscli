@@ -44,6 +44,7 @@ pub struct Options {
     #[arg(long, env, default_value = "")]
     pub package_name: String,
     /// Package version, used together with `--tag-format` when `--release-tag` is absent.
+    /// Defaults to the version field in Cargo.toml when not provided.
     #[arg(long, env, default_value = "")]
     pub version: String,
     /// Release title. Defaults to the tag name when not set.
@@ -158,11 +159,8 @@ async fn find_or_create_draft_release(
 /// Validates the combination of options before any I/O is performed.
 ///
 /// Returns an error describing the first violated constraint, if any.
+/// Note: empty `version` is allowed here — the caller falls back to Cargo.toml.
 pub fn validate_options(options: &Options) -> anyhow::Result<()> {
-    if options.release_tag.is_none() && options.version.is_empty() {
-        anyhow::bail!("--version or --release-tag is required");
-    }
-
     if options.release_tag.is_none()
         && options.tag_format.contains("{package_name}")
         && options.package_name.is_empty()
@@ -173,10 +171,28 @@ pub fn validate_options(options: &Options) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Reads version and package name from the root package in Cargo.toml.
+fn read_cargo_metadata(working_directory: &PathBuf) -> anyhow::Result<(String, String)> {
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .current_dir(working_directory)
+        .no_deps()
+        .exec()
+        .context("Failed to read Cargo.toml metadata")?;
+
+    let root_package = metadata
+        .root_package()
+        .context("No root package found in Cargo.toml")?;
+
+    Ok((
+        root_package.version.to_string(),
+        root_package.name.to_string(),
+    ))
+}
+
 /// Creates or updates a draft GitHub release and uploads all files from the artifacts directory.
 pub async fn draft_release(
-    options: Box<Options>,
-    _working_directory: PathBuf,
+    mut options: Box<Options>,
+    working_directory: PathBuf,
 ) -> anyhow::Result<DraftReleaseResult> {
     let (Some(github_app_id), Some(github_app_private_key)) = (
         options.github_app_id,
@@ -186,6 +202,16 @@ pub async fn draft_release(
     };
 
     validate_options(&options)?;
+
+    // Fall back to Cargo.toml when version (or package name) is not supplied and no
+    // explicit release tag was given — both are needed to derive the tag from the format.
+    if options.release_tag.is_none() && options.version.is_empty() {
+        let (cargo_version, cargo_name) = read_cargo_metadata(&working_directory)?;
+        options.version = cargo_version;
+        if options.package_name.is_empty() {
+            options.package_name = cargo_name;
+        }
+    }
 
     let tag = match &options.release_tag {
         Some(explicit) => explicit.clone(),
@@ -272,25 +298,19 @@ mod tests {
     }
 
     #[test]
-    fn should_error_when_release_tag_absent_and_version_empty() {
-        // Arrange
+    fn should_pass_when_release_tag_absent_and_version_empty() {
+        // validate_options no longer rejects an empty version — the caller falls back
+        // to reading the version from Cargo.toml in that case.
         let options = Options {
             release_tag: None,
             version: String::new(),
+            tag_format: "v{version}".to_string(), // no {package_name} → no other constraint
             ..base_options()
         };
 
-        // Act
         let result = validate_options(&options);
 
-        // Assert
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("--version or --release-tag is required")
-        );
+        assert!(result.is_ok());
     }
 
     #[test]
