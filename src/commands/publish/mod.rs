@@ -195,7 +195,7 @@ pub struct PublishResult {
     pub cargo: HashMap<String, PublishDetailResult>, // HashMap on Registries
     pub nix_binary: PublishDetailResult,
     pub git_tag: PublishDetailResult,
-    pub s3: PublishDetailResult,
+    pub s3: HashMap<String, PublishDetailResult>,
     pub start_time: Option<SystemTime>,
     pub end_time: Option<SystemTime>,
 }
@@ -224,14 +224,20 @@ impl PublishResult {
                 should_publish: options.handle_tags,
                 ..Default::default()
             },
-            s3: PublishDetailResult {
-                name: format!("{crate_name}@{crate_version} s3"),
-                key: "s3".to_string(),
-                should_publish: package.publish_detail.s3.publish,
-                ..Default::default()
-            },
             ..Default::default()
         };
+
+        for (dest_name, _dest) in package.publish_detail.s3.resolved_destinations() {
+            s.s3.insert(
+                dest_name.clone(),
+                PublishDetailResult {
+                    name: format!("{crate_name}@{crate_version} s3:{dest_name}"),
+                    key: format!("s3_{dest_name}"),
+                    should_publish: package.publish_detail.s3.publish,
+                    ..Default::default()
+                },
+            );
+        }
 
         for registry_name in &registries {
             s.cargo.insert(
@@ -256,18 +262,19 @@ impl PublishResult {
     pub fn with_failed(mut self, failed: bool) -> Self {
         self.success = !failed;
         if failed {
-            for detail in [
-                &mut self.docker,
-                &mut self.nix_binary,
-                &mut self.git_tag,
-                &mut self.s3,
-            ] {
+            for detail in [&mut self.docker, &mut self.nix_binary, &mut self.git_tag] {
                 if detail.should_publish && detail.stderr.is_empty() {
                     detail.success = false;
                     detail.stderr = "skipped: a dependency failed to publish".to_string();
                 }
             }
             for detail in self.cargo.values_mut() {
+                if detail.should_publish && detail.stderr.is_empty() {
+                    detail.success = false;
+                    detail.stderr = "skipped: a dependency failed to publish".to_string();
+                }
+            }
+            for detail in self.s3.values_mut() {
                 if detail.should_publish && detail.stderr.is_empty() {
                     detail.success = false;
                     detail.stderr = "skipped: a dependency failed to publish".to_string();
@@ -304,8 +311,10 @@ impl PublishResults {
                     &publish_result.nix_binary,
                     &publish_result.docker,
                     &publish_result.git_tag,
-                    &publish_result.s3,
                 ];
+                for s3_result in publish_result.s3.values() {
+                    results.push(s3_result);
+                }
                 for cargo in publish_result.cargo.values() {
                     results.push(cargo);
                 }
@@ -325,7 +334,11 @@ impl PublishResults {
             let package_version = &package.version;
             let file_prefix = format!("{package_name}__{package_version}");
             if let Some(publish_result) = self.published_members.get(package_id) {
-                let mut results = vec![&publish_result.nix_binary, &publish_result.docker];
+                let mut results: Vec<&PublishDetailResult> =
+                    vec![&publish_result.nix_binary, &publish_result.docker];
+                for s3_result in publish_result.s3.values() {
+                    results.push(s3_result);
+                }
                 for cargo in publish_result.cargo.values() {
                     results.push(cargo);
                 }
@@ -443,7 +456,26 @@ impl Display for PublishResults {
                 publish_result.docker.get_status(),
                 cargo_reg,
                 publish_result.nix_binary.get_status(),
-                publish_result.s3.get_status(),
+                {
+                    let s3_statuses: Vec<_> = publish_result.s3.values().collect();
+                    if s3_statuses.len() == 1 {
+                        s3_statuses[0].get_status()
+                    } else if s3_statuses.is_empty() {
+                        "-".to_string()
+                    } else if s3_statuses
+                        .iter()
+                        .filter(|s| s.should_publish)
+                        .all(|s| s.success)
+                    {
+                        format!("✓ ({})", s3_statuses.len())
+                    } else {
+                        let failed = s3_statuses
+                            .iter()
+                            .filter(|s| s.should_publish && !s.success)
+                            .count();
+                        format!("✗ ({}/{})", failed, s3_statuses.len())
+                    }
+                },
                 width = cargo_size,
             )?;
         }
@@ -661,6 +693,209 @@ pub async fn create_cloudfront_invalidation(
     ))
 }
 
+/// Uploads the contents of `build_dir` to a single S3 destination, then optionally
+/// sync-deletes stale objects and invalidates CloudFront.
+async fn publish_to_s3_destination(
+    dest_name: &str,
+    dest: &crate::commands::check_workspace::S3Destination,
+    build_dir: &Path,
+    options: &Options,
+    result: &mut PublishDetailResult,
+) {
+    let prefix = dest.credentials_env_prefix.as_deref().unwrap_or("S3");
+    let access_key_id = std::env::var(format!("{}_ACCESS_KEY_ID", prefix))
+        .ok()
+        .or_else(|| options.s3_access_key_id.clone());
+    let secret_access_key = std::env::var(format!("{}_SECRET_ACCESS_KEY", prefix))
+        .ok()
+        .or_else(|| options.s3_secret_access_key.clone());
+    let endpoint = std::env::var(format!("{}_ENDPOINT", prefix))
+        .ok()
+        .or_else(|| options.s3_endpoint.clone());
+
+    let mut uploaded_paths: Vec<String> = Vec::new();
+
+    match create_s3_client(
+        dest.bucket_name.clone(),
+        dest.bucket_region.clone(),
+        access_key_id,
+        secret_access_key,
+        endpoint,
+    )
+    .await
+    {
+        Ok(store_client) => {
+            result.success = true;
+            let prefix_str = dest.bucket_prefix.as_ref();
+
+            for entry in WalkDir::new(build_dir) {
+                match entry {
+                    Ok(entry) if entry.file_type().is_file() => {
+                        let path = entry.path();
+                        let relative = match path.strip_prefix(build_dir) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                result.success = false;
+                                result.stderr =
+                                    format!("{}\nPath strip error: {}", result.stderr, e);
+                                return;
+                            }
+                        };
+                        let key = match prefix_str {
+                            Some(p) => format!("{}/{}", p, relative.display()),
+                            None => relative.display().to_string(),
+                        };
+                        match fs::read(path) {
+                            Ok(bytes) => {
+                                let content_type = mime_guess::from_path(path)
+                                    .first_or_octet_stream()
+                                    .to_string();
+                                let cache_control =
+                                    if path.extension().is_some_and(|ext| ext == "html") {
+                                        "public, max-age=0, must-revalidate"
+                                    } else {
+                                        "public, max-age=31536000, immutable"
+                                    };
+                                match store_client
+                                    .write_with(&key, bytes)
+                                    .content_type(&content_type)
+                                    .cache_control(cache_control)
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        result.stdout = format!(
+                                            "{}\nUploaded: {} (Content-Type: {}, Cache-Control: {})",
+                                            result.stdout, key, content_type, cache_control
+                                        );
+                                        uploaded_paths.push(key.clone());
+                                    }
+                                    Err(e) => {
+                                        result.success = false;
+                                        result.stderr = format!(
+                                            "{}\nUpload failed {}: {}",
+                                            result.stderr, key, e
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                result.success = false;
+                                result.stderr = format!(
+                                    "{}\nRead failed {}: {}",
+                                    result.stderr,
+                                    path.display(),
+                                    e
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    Ok(_) => {} // directory, skip
+                    Err(e) => {
+                        result.success = false;
+                        result.stderr = format!("{}\nWalk error: {}", result.stderr, e);
+                        return;
+                    }
+                }
+            }
+
+            // Sync delete: remove stale objects not present in this upload
+            if dest.sync_delete.unwrap_or(false) {
+                match prefix_str {
+                    None => {
+                        result.stderr = format!(
+                            "{}\nsync_delete requires bucket_prefix to be set; skipping deletion to avoid wiping entire bucket",
+                            result.stderr
+                        );
+                        result.success = false;
+                        return;
+                    }
+                    Some(p) => {
+                        let list_prefix = format!("{}/", p);
+                        info!(
+                            "Sync-deleting stale S3 objects under prefix: {} (dest: {})",
+                            list_prefix, dest_name
+                        );
+                        let uploaded_set: HashSet<&str> =
+                            uploaded_paths.iter().map(|s| s.as_str()).collect();
+                        match store_client.list(&list_prefix).await {
+                            Ok(entries) => {
+                                for entry in entries {
+                                    let entry_path = entry.path().to_string();
+                                    if entry_path.ends_with('/') {
+                                        continue;
+                                    }
+                                    if !uploaded_set.contains(entry_path.as_str()) {
+                                        match store_client.delete(&entry_path).await {
+                                            Ok(_) => {
+                                                result.stdout = format!(
+                                                    "{}\nDeleted stale: {}",
+                                                    result.stdout, entry_path
+                                                );
+                                            }
+                                            Err(e) => {
+                                                result.success = false;
+                                                result.stderr = format!(
+                                                    "{}\nDelete failed {}: {}",
+                                                    result.stderr, entry_path, e
+                                                );
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                result.success = false;
+                                result.stderr = format!(
+                                    "{}\nList failed for sync_delete: {}",
+                                    result.stderr, e
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // CloudFront invalidation — CLI flag takes precedence over per-destination config
+            let distribution_id = options
+                .cloudfront_distribution_id
+                .as_ref()
+                .or(dest.cloudfront_distribution_id.as_ref());
+
+            if let Some(distribution_id) = distribution_id {
+                info!(
+                    "Creating CloudFront invalidation for distribution: {} (dest: {})",
+                    distribution_id, dest_name
+                );
+                match create_cloudfront_invalidation(
+                    distribution_id,
+                    uploaded_paths,
+                    dest.bucket_region.clone(),
+                )
+                .await
+                {
+                    Ok(msg) => {
+                        result.stdout = format!("{}\n{}", result.stdout, msg);
+                        info!("{}", msg);
+                    }
+                    Err(e) => {
+                        let err_msg = format!("CloudFront invalidation warning: {}", e);
+                        result.stderr = format!("{}\n{}", result.stderr, err_msg);
+                        tracing::warn!("{}", err_msg);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            result.success = false;
+            result.stderr = format!("{}\n{}", result.stderr, e);
+        }
+    }
+}
+
 struct DoPublishParams {
     repo_root: PathBuf,
     package: Package,
@@ -707,9 +942,17 @@ async fn do_publish_package(params: DoPublishParams) -> PublishResult {
     let package_path = repo_root.join(&package.path);
     let mut is_failed = false;
     if !is_failed && should_run_step(&options, PublishStep::S3, package.publish_detail.s3.publish) {
-        result.s3.start_time = Some(SystemTime::now());
+        // Extract what we need before any moves
+        let s3_build_command = package.publish_detail.s3.build_command.clone();
+        let s3_output_dir = package.publish_detail.s3.output_dir.clone();
+        let s3_destinations = package.publish_detail.s3.resolved_destinations();
+
         if options.dry_run {
-            result.s3.success = true;
+            for dest_result in result.s3.values_mut() {
+                dest_result.start_time = Some(SystemTime::now());
+                dest_result.success = true;
+                dest_result.end_time = Some(SystemTime::now());
+            }
         } else {
             let mut envs = HashMap::new();
             let mut blacklist_envs =
@@ -739,13 +982,18 @@ async fn do_publish_package(params: DoPublishParams) -> PublishResult {
                 let user_agent_env = format!("{main_registry_prefix}_USER_AGENT");
                 let token_env = format!("{main_registry_prefix}_TOKEN");
                 let name_env = format!("{main_registry_prefix}_NAME");
-                envs.insert(user_agent_env.clone(), user_agent);
-                envs.insert(token_env.clone(), token);
-                envs.insert(name_env.clone(), common_options.cargo_main_registry.clone());
+                envs.insert(user_agent_env, user_agent);
+                envs.insert(token_env, token);
+                envs.insert(name_env, common_options.cargo_main_registry.clone());
             }
-            // First we build
-            let build_command = package.publish_detail.s3.build_command;
-            let command_output = Script::new(&build_command, true)
+
+            // Mark start time for all destinations
+            for dest_result in result.s3.values_mut() {
+                dest_result.start_time = Some(SystemTime::now());
+            }
+
+            // Build once for all destinations
+            let command_output = Script::new(&s3_build_command, true)
                 .current_dir(&package_path)
                 .env_removals(&blacklist_envs)
                 .envs(&envs)
@@ -753,147 +1001,41 @@ async fn do_publish_package(params: DoPublishParams) -> PublishResult {
                 .log_stderr(tracing::Level::INFO)
                 .execute()
                 .await;
-            result.s3.update_from_command(command_output);
-            is_failed = !result.s3.success;
-            if !is_failed {
-                let mut uploaded_paths: Vec<String> = Vec::new();
-                match create_s3_client(
-                    package.publish_detail.s3.bucket_name.clone(),
-                    package.publish_detail.s3.bucket_region.clone(),
-                    options.s3_access_key_id.clone(),
-                    options.s3_secret_access_key.clone(),
-                    options.s3_endpoint.clone(),
-                )
-                .await
-                {
-                    Ok(store_client) => {
-                        // Let's upload the output dir to s3
-                        let prefix = package.publish_detail.s3.bucket_prefix;
-                        let build_dir = package_path.join(
-                            package
-                                .publish_detail
-                                .s3
-                                .output_dir
-                                .unwrap_or("".to_string()),
-                        );
-                        for entry in WalkDir::new(&build_dir) {
-                            match entry {
-                                Ok(entry) if entry.file_type().is_file() => {
-                                    let path = entry.path();
-                                    let relative = match path.strip_prefix(&build_dir) {
-                                        Ok(r) => r,
-                                        Err(e) => {
-                                            result.s3.success = false;
-                                            result.s3.stderr = format!(
-                                                "{}\nPath strip error: {}",
-                                                result.s3.stderr, e
-                                            );
-                                            is_failed = true;
-                                            break;
-                                        }
-                                    };
-                                    let key = match &prefix {
-                                        Some(p) => format!("{}/{}", p, relative.display()),
-                                        None => relative.display().to_string(),
-                                    };
-                                    match fs::read(path) {
-                                        Ok(bytes) => {
-                                            let content_type = mime_guess::from_path(path)
-                                                .first_or_octet_stream()
-                                                .to_string();
 
-                                            match store_client
-                                                .write_with(&key, bytes)
-                                                .content_type(&content_type)
-                                                .await
-                                            {
-                                                Ok(_) => {
-                                                    result.s3.stdout = format!(
-                                                        "{}\nUploaded: {} (Content-Type: {})",
-                                                        result.s3.stdout, key, content_type
-                                                    );
-                                                    uploaded_paths.push(key.clone());
-                                                }
-                                                Err(e) => {
-                                                    result.s3.success = false;
-                                                    result.s3.stderr = format!(
-                                                        "{}\nUpload failed {}: {}",
-                                                        result.s3.stderr, key, e
-                                                    );
-                                                    is_failed = true;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            result.s3.success = false;
-                                            result.s3.stderr = format!(
-                                                "{}\nRead failed {}: {}",
-                                                result.s3.stderr,
-                                                path.display(),
-                                                e
-                                            );
-                                            is_failed = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                                Ok(_) => {} // directory, skip
-                                Err(e) => {
-                                    result.s3.success = false;
-                                    result.s3.stderr =
-                                        format!("{}\nWalk error: {}", result.s3.stderr, e);
-                                    is_failed = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        result.s3.success = false;
-                        result.s3.stderr = format!("{}\n{}", result.s3.stderr, e);
-                        is_failed = true;
-                    }
-                }
+            let build_success = command_output.success;
 
-                // CloudFront cache invalidation (if configured)
-                // CLI option takes precedence over package metadata
-                if !is_failed {
-                    let distribution_id = options.cloudfront_distribution_id.as_ref().or(package
-                        .publish_detail
-                        .s3
-                        .cloudfront_distribution_id
-                        .as_ref());
+            // Propagate build output to all destination results
+            for dest_result in result.s3.values_mut() {
+                dest_result.update_from_command(command_output.clone());
+            }
 
-                    if let Some(distribution_id) = distribution_id {
-                        info!(
-                            "Creating CloudFront invalidation for distribution: {}",
-                            distribution_id
-                        );
-                        match create_cloudfront_invalidation(
-                            distribution_id,
-                            uploaded_paths,
-                            package.publish_detail.s3.bucket_region.clone(),
+            if build_success {
+                let build_dir = package_path.join(s3_output_dir.as_deref().unwrap_or(""));
+
+                for (dest_name, dest) in &s3_destinations {
+                    if let Some(dest_result) = result.s3.get_mut(dest_name) {
+                        publish_to_s3_destination(
+                            dest_name,
+                            dest,
+                            &build_dir,
+                            &options,
+                            dest_result,
                         )
-                        .await
-                        {
-                            Ok(msg) => {
-                                result.s3.stdout = format!("{}\n{}", result.s3.stdout, msg);
-                                info!("{}", msg);
-                            }
-                            Err(e) => {
-                                // CloudFront invalidation failure should not fail the entire publish
-                                // but we should warn about it
-                                let err_msg = format!("CloudFront invalidation warning: {}", e);
-                                result.s3.stderr = format!("{}\n{}", result.s3.stderr, err_msg);
-                                tracing::warn!("{}", err_msg);
-                            }
+                        .await;
+
+                        if !dest_result.success {
+                            is_failed = true;
                         }
                     }
                 }
+            } else {
+                is_failed = true;
+            }
+
+            for dest_result in result.s3.values_mut() {
+                dest_result.end_time = Some(SystemTime::now());
             }
         }
-        result.s3.end_time = Some(SystemTime::now());
     }
     if !is_failed
         && should_run_step(
