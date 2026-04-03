@@ -147,6 +147,7 @@ impl Script {
     }
 }
 
+#[derive(Clone)]
 pub struct CommandOutput {
     pub stdout: String,
     pub stderr: String,

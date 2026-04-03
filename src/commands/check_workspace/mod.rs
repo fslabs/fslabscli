@@ -35,6 +35,7 @@ use docker::PackageMetadataFslabsCiPublishDocker;
 use nix_binary::PackageMetadataFslabsCiPublishNixBinary;
 use npm::{Npm, PackageMetadataFslabsCiPublishNpmNapi};
 use s3::PackageMetadataFslabsCiPublishS3;
+pub use s3::S3Destination;
 
 use crate::{PackageRelatedOptions, PrettyPrintable};
 
