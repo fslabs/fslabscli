@@ -750,8 +750,17 @@ async fn publish_to_s3_destination(
                                 let content_type = mime_guess::from_path(path)
                                     .first_or_octet_stream()
                                     .to_string();
+                                // These cache settings assume that assets are deployed with unique
+                                // names, which is true for most build systems (including Trunk).
+                                // The exceptions are the entry files, which point to the other
+                                // files, and must not be cached so aggressively. Usually, those
+                                // files are html files or service workers.
                                 let cache_control =
-                                    if path.extension().is_some_and(|ext| ext == "html") {
+                                    if path.extension().is_some_and(|ext| ext == "html")
+                                        || path
+                                            .file_name()
+                                            .is_some_and(|file_name| file_name == "sw.js")
+                                    {
                                         "public, max-age=0, must-revalidate"
                                     } else {
                                         "public, max-age=31536000, immutable"
