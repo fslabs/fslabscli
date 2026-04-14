@@ -1685,6 +1685,7 @@ pub async fn report_publish_to_github(
                             {
                                 let notes = repo_releases
                                     .generate_release_notes(&release_tag)
+                                    .target_commitish("main")
                                     .send()
                                     .await
                                     .ok();
