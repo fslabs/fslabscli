@@ -1607,15 +1607,37 @@ pub async fn report_publish_to_github(
                 base_rev.to_string()
             } else {
                 // base_rev is a commit reference, resolve it to a tag
-                let resolved_tag =
-                    resolve_commit_to_tag(repo_root, base_rev, &options.tag_pattern)?;
-                tracing::info!(
-                    "Resolved commit {} to tag: {} (pattern: {})",
-                    base_rev,
-                    resolved_tag,
-                    options.tag_pattern
-                );
-                resolved_tag
+                match resolve_commit_to_tag(repo_root, base_rev, &options.tag_pattern) {
+                    Ok(resolved_tag) => {
+                        tracing::info!(
+                            "Resolved commit {} to tag: {} (pattern: {})",
+                            base_rev,
+                            resolved_tag,
+                            options.tag_pattern
+                        );
+                        resolved_tag
+                    }
+                    Err(e) if options.draft => {
+                        // Draft mode without a git tag (e.g. --publish-steps nix,github skips cargo/tagging).
+                        // Compute the expected release tag from Cargo.toml + tag_format.
+                        tracing::info!(
+                            "No tag found on {} ({}); computing tag from Cargo.toml for draft release",
+                            base_rev,
+                            e
+                        );
+                        let manifest: toml::Value = toml::from_str(
+                            &std::fs::read_to_string(repo_root.join("Cargo.toml"))
+                                .with_context(|| "Failed to read workspace Cargo.toml")?,
+                        )
+                        .with_context(|| "Failed to parse workspace Cargo.toml")?;
+                        let version = manifest["package"]["version"].as_str().unwrap_or("0.0.0");
+                        let package_name = manifest["package"]["name"].as_str().unwrap_or("");
+                        let tag = format_tag(&options.tag_format, package_name, version);
+                        tracing::info!("Computed draft release tag: {}", tag);
+                        tag
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         };
 
@@ -1657,28 +1679,45 @@ pub async fn report_publish_to_github(
                                 "No draft release found for tag {}, creating one",
                                 release_tag
                             );
-                            repo_releases
-                                .create(&release_tag)
-                                .draft(true)
-                                .send()
-                                .await
-                                .with_context(|| {
+                            {
+                                let notes = repo_releases
+                                    .generate_release_notes(&release_tag)
+                                    .target_commitish("main")
+                                    .send()
+                                    .await
+                                    .ok();
+                                let mut builder = repo_releases
+                                    .create(&release_tag)
+                                    .name(&release_tag)
+                                    .draft(true);
+                                if let Some(notes) = &notes {
+                                    builder = builder.body(&notes.body);
+                                }
+                                builder.send().await.with_context(|| {
                                     format!(
                                         "Failed to create draft release for tag: {}",
                                         release_tag
                                     )
                                 })?
+                            }
                         }
                     }
                 } else {
                     tracing::info!("No existing release for tag {}, creating one", release_tag);
-                    repo_releases
-                        .create(&release_tag)
-                        .send()
-                        .await
-                        .with_context(|| {
+                    {
+                        let notes = repo_releases
+                            .generate_release_notes(&release_tag)
+                            .send()
+                            .await
+                            .ok();
+                        let mut builder = repo_releases.create(&release_tag).name(&release_tag);
+                        if let Some(notes) = &notes {
+                            builder = builder.body(&notes.body);
+                        }
+                        builder.send().await.with_context(|| {
                             format!("Failed to create release for tag: {}", release_tag)
                         })?
+                    }
                 }
             }
             Err(e) => {
