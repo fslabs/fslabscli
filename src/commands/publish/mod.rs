@@ -1682,28 +1682,46 @@ pub async fn report_publish_to_github(
                                 "No draft release found for tag {}, creating one",
                                 release_tag
                             );
-                            repo_releases
-                                .create(&release_tag)
-                                .draft(true)
-                                .send()
-                                .await
-                                .with_context(|| {
+                            {
+                                let notes = repo_releases
+                                    .generate_release_notes(&release_tag)
+                                    .send()
+                                    .await
+                                    .ok();
+                                let mut builder = repo_releases
+                                    .create(&release_tag)
+                                    .name(&release_tag)
+                                    .draft(true);
+                                if let Some(notes) = &notes {
+                                    builder = builder.body(&notes.body);
+                                }
+                                builder.send().await.with_context(|| {
                                     format!(
                                         "Failed to create draft release for tag: {}",
                                         release_tag
                                     )
                                 })?
+                            }
                         }
                     }
                 } else {
                     tracing::info!("No existing release for tag {}, creating one", release_tag);
-                    repo_releases
-                        .create(&release_tag)
-                        .send()
-                        .await
-                        .with_context(|| {
+                    {
+                        let notes = repo_releases
+                            .generate_release_notes(&release_tag)
+                            .send()
+                            .await
+                            .ok();
+                        let mut builder = repo_releases
+                            .create(&release_tag)
+                            .name(&release_tag);
+                        if let Some(notes) = &notes {
+                            builder = builder.body(&notes.body);
+                        }
+                        builder.send().await.with_context(|| {
                             format!("Failed to create release for tag: {}", release_tag)
                         })?
+                    }
                 }
             }
             Err(e) => {
