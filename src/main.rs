@@ -416,7 +416,7 @@ async fn main() -> ExitCode {
             0
         }
         Err(e) => {
-            tracing::error!("Could not execute command: {}", e);
+            tracing::error!("Could not execute command: {:#}", e);
             1
         }
     };

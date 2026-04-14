@@ -16,7 +16,7 @@
       devenv,
       ...
     }:
-    flake-utils.lib.eachDefaultSystem (
+    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-darwin" ] (
       system:
       let
         overlays = [ ];
@@ -24,7 +24,7 @@
           inherit system overlays;
           stdenv = nixpkgs.clangStdenv;
         };
-        inherit (pkgs.stdenv) isDarwin;
+        inherit (pkgs.stdenv) isDarwin isLinux;
         lib = pkgs.lib;
         fenixPkgs = fenix.packages.${system};
         toolchain = fenixPkgs.fromToolchainFile {
@@ -106,10 +106,25 @@
         mkRustPackage =
           packageName:
           let
-            inherit (arch2targets.${system}) rustTarget;
+            inherit (arch2targets.${system}) rustTarget pkgsCross depsBuildBuild;
+            TARGET_CC = if isLinux then
+              "${pkgsCross.stdenv.cc}/bin/${pkgsCross.stdenv.cc.targetPrefix}cc"
+            else
+              "";
+            linuxStaticArgs = lib.optionalAttrs isLinux {
+              inherit TARGET_CC depsBuildBuild;
+              CARGO_BUILD_TARGET = rustTarget;
+              CARGO_BUILD_RUSTFLAGS = [
+                "-C" "linker=${TARGET_CC}"
+                "-C" "target-feature=+crt-static"
+              ];
+              CC = TARGET_CC;
+              LD = TARGET_CC;
+            };
           in
           (craneLib.buildPackage (
             (generateCommonArgs craneLib)
+            // linuxStaticArgs
             // {
               postInstall = ''
                 cd "$out"/bin
