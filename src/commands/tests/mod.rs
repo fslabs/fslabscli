@@ -1,4 +1,9 @@
+mod annotations;
 mod docker_service;
+
+use crate::commands::tests::annotations::{
+    AnnotationCollector, GhContext, parse_output_for, post_annotations,
+};
 
 use anyhow::Context;
 use clap::Parser;
@@ -11,7 +16,7 @@ use opentelemetry::{
 use port_check::free_local_port;
 use serde::Serialize;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     fmt::{Display, Formatter},
     fs::{File, create_dir_all, remove_dir_all},
@@ -297,6 +302,7 @@ pub async fn tests(
         changed_counter,
     };
     let semaphore = Arc::new(Semaphore::new(common_options.job_limit));
+    let annotation_collector = AnnotationCollector::new();
     let mut handles = vec![];
 
     // Precompute transitive dependency counts for sorting and display.
@@ -407,13 +413,20 @@ pub async fn tests(
     // group instead of once per package. This avoids target-dir lock
     // contention that serialises concurrent per-package cargo invocations
     // when many packages share the same workspace.
-    let batched_packages: Arc<HashSet<String>> = {
+    // Key includes workspace + version so two packages with the same name in
+    // different workspaces or at different versions (vendored baselines) do
+    // not collide. Keying on name alone silently skips fmt/check/clippy/doc
+    // for un-batched duplicates.
+    let batched_packages: Arc<HashSet<(String, String, String)>> = {
         // Group packages by (workspace, additional_args).
         // Store (name, version) so we can use `name@version` for -p flags
         // to disambiguate packages that exist at multiple versions (e.g.
-        // vendor baselines).
-        let mut batch_groups: HashMap<String, HashMap<String, Vec<(String, String)>>> =
-            HashMap::new();
+        // vendor baselines). BTreeMap so iteration order is deterministic
+        // across runs of the same commit; with HashMap the fail-fast
+        // `break 'batch` would surface a different workspace's failure each
+        // rerun.
+        let mut batch_groups: BTreeMap<String, BTreeMap<String, Vec<(String, String)>>> =
+            BTreeMap::new();
         for member in &members {
             let args = member.test_detail.args.clone().unwrap_or_default();
             batch_groups
@@ -539,8 +552,16 @@ pub async fn tests(
                 batch_junit_report.add_testsuite(ts);
 
                 if !lock_result.success {
+                    annotation_collector.push_many(parse_output_for(
+                        "cargo_lock",
+                        &lock_result,
+                        &ws_path,
+                        &repo_root,
+                    ));
                     global_failed = true;
-                    global_junit_report.add_testsuites(batch_junit_report.testsuites().clone());
+                    // The after-loop clone at the end of the labeled `'batch`
+                    // block picks up batch_junit_report; cloning again here
+                    // would emit every suite twice into the final report.
                     break 'batch;
                 }
             }
@@ -699,17 +720,31 @@ pub async fn tests(
                     ts.add_testcase(tc);
 
                     if !output.success {
+                        // Batch step ids are `batch_fmt`/`batch_check`/... but the
+                        // parsers dispatch on `cargo_fmt`/`cargo_check`/...
+                        let parser_id = id.replace("batch_", "cargo_");
+                        annotation_collector
+                            .push_many(parse_output_for(&parser_id, &output, &ws_path, &repo_root));
                         global_failed = true;
                         batch_junit_report.add_testsuite(ts);
-                        global_junit_report.add_testsuites(batch_junit_report.testsuites().clone());
+                        // Same reason as the lock failure path: don't clone
+                        // into global here; the after-loop clone catches it.
                         break 'batch;
                     }
                 }
 
                 batch_junit_report.add_testsuite(ts);
-                batched.extend(packages.iter().map(|(name, _)| name.clone()));
+                batched.extend(
+                    packages
+                        .iter()
+                        .map(|(name, version)| (workspace.clone(), name.clone(), version.clone())),
+                );
             }
         }
+        // Runs on both the success fall-through and the `break 'batch` failure
+        // paths; the failure paths therefore MUST NOT clone batch_junit_report
+        // into global_junit_report themselves or every batch suite is added
+        // twice.
         global_junit_report.add_testsuites(batch_junit_report.testsuites().clone());
         Arc::new(batched)
     };
@@ -734,6 +769,7 @@ pub async fn tests(
                     semaphore.clone(),
                     lock_check_cache.clone(),
                     batched_packages.clone(),
+                    annotation_collector.clone(),
                 )
                 .instrument(tracing::Span::current()),
             );
@@ -741,19 +777,43 @@ pub async fn tests(
         }
     }
 
-    // using `select_all` to allow fast failure
+    // Wait for every spawned package task to complete before we drain the
+    // annotation collector. Breaking early on the first failure would leave
+    // sibling tokio tasks running detached (dropping a JoinHandle doesn't
+    // abort), so annotations they push after we drain silently vanish. The
+    // semaphore already caps parallelism, so the wall-clock cost of waiting
+    // is just the longest still-running task after the first failure.
     while !handles.is_empty() {
         let (result, _, remaining) = futures::future::select_all(handles).await;
         handles = remaining;
-        if let Ok((failed, junit_report)) = result {
-            global_junit_report.add_testsuites(junit_report.testsuites().clone());
-            global_failed |= failed;
-            if failed {
-                break;
+        match result {
+            Ok((failed, junit_report)) => {
+                global_junit_report.add_testsuites(junit_report.testsuites().clone());
+                global_failed |= failed;
+            }
+            Err(_) => global_failed = true,
+        }
+    }
+
+    let collected_annotations = annotation_collector.drain();
+    if !collected_annotations.is_empty() {
+        if let Some(gh) = GhContext::from_env() {
+            let count = collected_annotations.len();
+            match post_annotations(&gh, collected_annotations, &global_junit_report).await {
+                Ok(()) => tracing::info!(
+                    "Posted {} GitHub check-run annotation(s) to {}/{}@{}",
+                    count,
+                    gh.owner,
+                    gh.repo,
+                    gh.head_sha
+                ),
+                Err(e) => tracing::warn!("Failed to post annotations: {:#}", e),
             }
         } else {
-            global_failed = true;
-            break;
+            tracing::debug!(
+                "Skipping GitHub annotations: missing REPO_OWNER / REPO_NAME / \
+                 PULL_PULL_SHA / GITHUB_TOKEN, or FSLABSCLI_ANNOTATIONS_DISABLE is set"
+            );
         }
     }
 
@@ -825,7 +885,8 @@ async fn do_test_on_package(
     metrics: Metrics,
     semaphore: Arc<Semaphore>,
     lock_check_cache: LockCheckCache,
-    batched_packages: Arc<HashSet<String>>,
+    batched_packages: Arc<HashSet<(String, String, String)>>,
+    annotation_collector: AnnotationCollector,
 ) -> (bool, Report) {
     let permit = semaphore.acquire().await;
 
@@ -837,6 +898,7 @@ async fn do_test_on_package(
         metrics,
         lock_check_cache,
         batched_packages,
+        annotation_collector,
     )
     .await;
     drop(permit);
@@ -854,6 +916,7 @@ async fn do_test_on_package(
         version = %member.version,
     )
 )]
+#[allow(clippy::too_many_arguments)]
 async fn run_package_tests(
     common_options: Arc<PackageRelatedOptions>,
     repo_root: PathBuf,
@@ -861,7 +924,8 @@ async fn run_package_tests(
     member: super::check_workspace::Result,
     metrics: Metrics,
     lock_check_cache: LockCheckCache,
-    batched_packages: Arc<HashSet<String>>,
+    batched_packages: Arc<HashSet<(String, String, String)>>,
+    annotation_collector: AnnotationCollector,
 ) -> (bool, Report) {
     let mut junit_report = ReportBuilder::new().build();
     let mut failed = false;
@@ -1215,12 +1279,7 @@ async fn run_package_tests(
     .cloned()
     .map(|mut t| {
         // Skip steps already handled by the workspace batch phase.
-        if batched_packages.contains(package_name)
-            && matches!(
-                t.id.as_str(),
-                "cargo_fmt" | "cargo_lock" | "cargo_check" | "cargo_clippy" | "cargo_doc"
-            )
-        {
+        if step_is_covered_by_batch(&batched_packages, workspace_name, package_name, package_version, &t.id) {
             t.skip = true;
         }
         // Let's check if the test need to be skip
@@ -1283,16 +1342,26 @@ async fn run_package_tests(
             let start_time = OffsetDateTime::now_utc();
 
             // Setup nextest configuration if this is the cargo_test step and nextest is available
-            if fslabs_test.id == "cargo_test" && use_nextest {
-                let config_dir = package_path.join(".config");
-                let config_file = config_dir.join("nextest.toml");
+            if fslabs_test.id == "cargo_test" {
+                // Delete any stale junit.xml before this step. The annotations
+                // parser reads that path whenever it exists; leaving a prior
+                // run's file in place would let ghost annotations attach to
+                // this run even when we invoked plain `cargo test` and never
+                // regenerated it.
+                if nextest_junit_path.exists() {
+                    let _ = std::fs::remove_file(&nextest_junit_path);
+                }
+                if use_nextest {
+                    let config_dir = package_path.join(".config");
+                    let config_file = config_dir.join("nextest.toml");
 
-                if let Err(e) = create_dir_all(&config_dir) {
-                    tracing::warn!("Failed to create .config directory: {}", e);
-                } else if let Ok(mut file) = File::create(&config_file) {
-                    let config_content = "[profile.default.junit]\npath = \"junit.xml\"\n";
-                    if let Err(e) = file.write_all(config_content.as_bytes()) {
-                        tracing::warn!("Failed to write nextest config: {}", e);
+                    if let Err(e) = create_dir_all(&config_dir) {
+                        tracing::warn!("Failed to create .config directory: {}", e);
+                    } else if let Ok(mut file) = File::create(&config_file) {
+                        let config_content = "[profile.default.junit]\npath = \"junit.xml\"\n";
+                        if let Err(e) = file.write_all(config_content.as_bytes()) {
+                            tracing::warn!("Failed to write nextest config: {}", e);
+                        }
                     }
                 }
             }
@@ -1385,6 +1454,14 @@ async fn run_package_tests(
 
             let end_time = OffsetDateTime::now_utc();
             let duration = end_time - start_time;
+
+            if !test_output.success {
+                let anns =
+                    parse_output_for(&fslabs_test.id, &test_output, &package_path, &repo_root);
+                if !anns.is_empty() {
+                    annotation_collector.push_many(anns);
+                }
+            }
 
             let mut status = "PASS";
             let mut tc = match test_output.success {
@@ -1523,6 +1600,32 @@ async fn run_package_tests(
     (failed, junit_report)
 }
 
+/// Return true if a step for `(workspace, package, version)` is already
+/// covered by the workspace-level batch phase and should be skipped in the
+/// per-package loop. Keying the batched set on the full tuple (rather than
+/// just the package name) prevents a batched `foo@0.1.0` in workspace W1
+/// from silently skipping an un-batched `foo@0.2.0` in workspace W2.
+fn step_is_covered_by_batch(
+    batched_packages: &HashSet<(String, String, String)>,
+    workspace: &str,
+    package: &str,
+    version: &str,
+    step_id: &str,
+) -> bool {
+    if !matches!(
+        step_id,
+        "cargo_fmt" | "cargo_lock" | "cargo_check" | "cargo_clippy" | "cargo_doc"
+    ) {
+        return false;
+    }
+    let key = (
+        workspace.to_string(),
+        package.to_string(),
+        version.to_string(),
+    );
+    batched_packages.contains(&key)
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -1590,5 +1693,86 @@ mod unit_tests {
         with_env_var("SKIP_EMPTYSTEP_TEST", "", || {
             assert!(!should_skip_step("emptystep"));
         });
+    }
+
+    fn batched_key(ws: &str, pkg: &str, ver: &str) -> (String, String, String) {
+        (ws.to_string(), pkg.to_string(), ver.to_string())
+    }
+
+    #[test]
+    fn batch_check_skips_batched_step_for_exact_tuple_match() {
+        let mut set = HashSet::new();
+        set.insert(batched_key("ws1", "foo", "0.1.0"));
+        assert!(step_is_covered_by_batch(
+            &set,
+            "ws1",
+            "foo",
+            "0.1.0",
+            "cargo_fmt"
+        ));
+        assert!(step_is_covered_by_batch(
+            &set,
+            "ws1",
+            "foo",
+            "0.1.0",
+            "cargo_clippy"
+        ));
+    }
+
+    #[test]
+    fn batch_check_does_not_skip_when_version_differs() {
+        // Regression: batched foo@0.1.0 must not cause un-batched foo@0.2.0 to
+        // be skipped. This is the vendored-baseline scenario the review
+        // flagged as silent test coverage loss.
+        let mut set = HashSet::new();
+        set.insert(batched_key("ws1", "foo", "0.1.0"));
+        assert!(!step_is_covered_by_batch(
+            &set,
+            "ws1",
+            "foo",
+            "0.2.0",
+            "cargo_fmt"
+        ));
+    }
+
+    #[test]
+    fn batch_check_does_not_skip_when_workspace_differs() {
+        // Same-name package in a different workspace also must not be skipped.
+        let mut set = HashSet::new();
+        set.insert(batched_key("ws1", "foo", "0.1.0"));
+        assert!(!step_is_covered_by_batch(
+            &set,
+            "ws2",
+            "foo",
+            "0.1.0",
+            "cargo_fmt"
+        ));
+    }
+
+    #[test]
+    fn batch_check_ignores_non_batched_step_ids() {
+        // cargo_test is never covered by the batch phase, so it must run
+        // per-package regardless of whether the package was batched.
+        let mut set = HashSet::new();
+        set.insert(batched_key("ws1", "foo", "0.1.0"));
+        assert!(!step_is_covered_by_batch(
+            &set,
+            "ws1",
+            "foo",
+            "0.1.0",
+            "cargo_test"
+        ));
+    }
+
+    #[test]
+    fn batch_check_returns_false_for_empty_set() {
+        let set = HashSet::new();
+        assert!(!step_is_covered_by_batch(
+            &set,
+            "ws1",
+            "foo",
+            "0.1.0",
+            "cargo_fmt"
+        ));
     }
 }

@@ -821,6 +821,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "serde_yml",
+ "sha2",
  "strum",
  "strum_macros",
  "temp-dir",
