@@ -22,51 +22,45 @@ To install, run the following command:
 ## Release Process
 
 **Version source of truth:** `Cargo.toml`
-**Tag format:** `v{version}` (e.g., `v2.43.0`) — configurable via `--tag-format`
+
+Releases are cut by pushing a release branch, not by merging to `main`. Merging to `main` runs
+tests only and triggers no publish job. The release trigger is a branch whose name matches the
+`publish` postsubmit's branch pattern configured in fslabs-infra
+(`modules/ci/prow/terragrunt.hcl`, currently `^cargo-fslabscli-\d+\.\d+\.\d+$`).
 
 ### Steps
 
-1. **Bump version** — Update `version` in `Cargo.toml`, open a PR with appropriate labels, merge to `main`. PRs with `skip-changelog` are excluded from release notes. Changelog categories are controlled by [.github/release.yml](.github/release.yml).
+1. **Bump version** — Update `version` in `Cargo.toml` (and the `cargo-fslabscli` entry in
+   `Cargo.lock`), open a PR, merge to `main`. Changelog categories for the generated release notes
+   are controlled by [.github/release.yml](.github/release.yml).
 
-2. **Draft release auto-created** — On push to `main`, a Prow postsubmit runs `fslabscli draft-release`, which:
-   - Creates or updates a draft GitHub Release tagged `v{version}`
-   - Generates changelog from merged PRs (GitHub native release notes)
-   - Builds and uploads binary artifacts to the draft
-   - Pushes the Nix build to the cache
+2. **Push the release branch** — From the merged `main`, push a branch named
+   `cargo-fslabscli-{version}` (e.g. `cargo-fslabscli-2.46.0`). This fires the Prow `publish-all`
+   postsubmit, which runs `fslabscli publish` and:
+   - Builds the release binaries
+   - Publishes the crate to the `fsl` Cargo registry
+   - Builds and pushes the Docker image
+   - Creates the GitHub release and its tag
 
-3. **Publish the draft** — Review the draft release on GitHub, verify all assets are present, click **"Publish release"**. This creates the git tag and locks the release assets.
-
-4. **Post-publish automation** — The new tag triggers Prow to:
-   - Publish the crate to the `fsl` Cargo registry
-   - Build and push the Docker image
-   - Mark the release as **"latest"**
-   - Kargo detects the new tag and starts canary promotion
+3. **Downstream** — Kargo detects the new tag and starts canary promotion. In fslabs-infra,
+   updatecli bumps `fslabscli_version` in the prow-tests image so CI uses the new binary.
 
 ### Flow
 
 ``` mermaid
 sequenceDiagram
     actor Dev as Developer
-    participant GH as GitHub (main)
-    participant Prow as Prow (draft-release)
+    participant GH as GitHub
+    participant Prow as Prow (publish-all)
     participant Rel as GitHub Release
-    participant Prow2 as Prow (post-publish)
     participant Kargo as Kargo
 
     Dev->>GH: Merge PR (version bump in Cargo.toml)
-    GH->>Prow: Postsubmit on push to main
-    Prow->>Prow: Build Nix binary, push to cache
-    Prow->>Rel: Create/update draft release<br/>tag: v{version}, changelog from PR labels
-    Prow->>Rel: Upload binary artifacts
-
-    Dev->>Rel: Review draft, verify assets, click "Publish release"
-    Note over Rel: Git tag created, assets locked
-
-    Rel->>Prow2: Webhook (tag created)
-    Prow2->>Prow2: Publish crate to fsl registry
-    Prow2->>Prow2: Build & push Docker image
-    Prow2->>Rel: Mark as "latest"
-
+    Dev->>GH: Push branch cargo-fslabscli-{version}
+    GH->>Prow: Postsubmit on the cargo-fslabscli-* branch
+    Prow->>Prow: Build binaries, publish crate to fsl registry
+    Prow->>Prow: Build & push Docker image
+    Prow->>Rel: Create release + tag
     Rel->>Kargo: Tag detected
     Kargo->>Kargo: Start canary promotion
 ```
