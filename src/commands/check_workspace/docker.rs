@@ -9,7 +9,11 @@ pub struct PackageMetadataFslabsCiPublishDocker {
     pub context: Option<String>,
     pub dockerfile: Option<String>,
     /// BuildKit secret IDs mapped to environment variable names, never values.
-    #[serde(default, deserialize_with = "deserialize_secrets")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_secrets",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub secrets: BTreeMap<String, String>,
     #[serde(default)]
     pub error: Option<String>,
@@ -79,10 +83,16 @@ mod tests {
         let metadata: PackageMetadataFslabsCiPublishDocker =
             serde_json::from_str(r#"{"publish":true}"#).unwrap();
         assert!(metadata.secrets.is_empty());
+        assert!(
+            serde_json::to_value(&metadata)
+                .unwrap()
+                .get("secrets")
+                .is_none()
+        );
     }
 
     #[test]
-    fn rejects_shell_syntax_and_literal_values() {
+    fn rejects_invalid_secret_identifiers() {
         for secrets in [
             serde_json::json!({"token;command": "SOURCE_TOKEN"}),
             serde_json::json!({"token": "$(command)"}),
