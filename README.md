@@ -124,3 +124,19 @@ sequenceDiagram
     Rel->>Kargo: Tag detected
     Kargo->>Kargo: Start canary promotion
 ```
+
+### Docker build secrets
+
+Map BuildKit secret IDs to environment variable names in package metadata:
+
+```toml
+[package.metadata.fslabs.publish.docker]
+publish = true
+secrets = { source_token = "SOURCE_TOKEN" }
+```
+
+Set the named environment variable in the publishing job. The publisher passes
+`--secret id=source_token,env=SOURCE_TOKEN` to Docker Buildx. The Dockerfile can
+read it with `RUN --mount=type=secret,id=source_token,required=true ...`.
+Store only variable names in metadata. Secret values remain in the environment
+and BuildKit secret mount.
