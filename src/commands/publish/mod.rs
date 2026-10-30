@@ -986,6 +986,20 @@ struct CargoReleasePlanEntry {
     source: &'static str,
 }
 
+fn fail_on_docker_lookup_errors(members: &HashMap<PackageId, Package>) -> anyhow::Result<()> {
+    for package in members.values() {
+        if let Some(error) = &package.publish_detail.docker.error {
+            anyhow::bail!(
+                "Could not check Docker image {}:{}: {}",
+                package.package,
+                package.version,
+                error
+            );
+        }
+    }
+    Ok(())
+}
+
 fn cargo_release_plan(
     members: &HashMap<PackageId, Package>,
     target_registry: Option<&str>,
@@ -2234,6 +2248,8 @@ pub async fn publish(
             })
             .with_context(|| "Could not get directory information")?;
 
+    fail_on_docker_lookup_errors(&results.members)?;
+
     let cargo_release_plan = cargo_release_plan(
         &results.members,
         common_options.cargo_target_registry.as_deref(),
@@ -2377,8 +2393,9 @@ mod tests {
 
     use super::{
         CargoReleaseAction, CargoReleasePlanEntry, Options, PublishStep, cargo_release_plan,
-        ensure_cargo_group, kellnr_api_base_url, kellnr_crate_group_url, kellnr_retry_delay,
-        resolve_commit_to_tag, should_expand_marked_cargo, should_run_package_step,
+        ensure_cargo_group, fail_on_docker_lookup_errors, kellnr_api_base_url,
+        kellnr_crate_group_url, kellnr_retry_delay, resolve_commit_to_tag,
+        should_expand_marked_cargo, should_run_package_step,
     };
     use crate::commands::check_workspace::{PackageMetadataFslabsCiPublish, Result as Package};
     use crate::utils::cargo::{Cargo, CargoRegistry};
@@ -2406,6 +2423,16 @@ mod tests {
         package.cargo_root = cargo_root;
         package.cargo_only = cargo_only;
         (package_id, package)
+    }
+
+    #[test]
+    fn docker_lookup_error_stops_publish() {
+        let (id, mut package) = cargo_plan_package("expgen-server", HashMap::new(), false, false);
+        package.publish_detail.docker.error = Some("UnauthorizedError".to_string());
+        let members = HashMap::from([(id, package)]);
+        let error = fail_on_docker_lookup_errors(&members).unwrap_err();
+        assert!(error.to_string().contains("expgen-server:1.0.0"));
+        assert!(error.to_string().contains("UnauthorizedError"));
     }
 
     const TEST_CARGO_TOKEN: &str = "test-cargo-token";

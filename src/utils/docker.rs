@@ -76,8 +76,44 @@ impl OciClient for RealOciClient {
         image: &Reference,
         auth: &RegistryAuth,
     ) -> Result<String, OciDistributionError> {
-        self.client.fetch_manifest_digest(image, auth).await
+        match self.client.fetch_manifest_digest(image, auth).await {
+            Err(error @ OciDistributionError::UnauthorizedError { .. })
+                if image.registry().ends_with(".azurecr.io") =>
+            {
+                // Prow logs into ACR through Docker. Use that login if the OCI
+                // client cannot read the manifest with the same credentials.
+                match tokio::process::Command::new("docker")
+                    .args(["buildx", "imagetools", "inspect", &image.to_string()])
+                    .output()
+                    .await
+                {
+                    Ok(output) if output.status.success() => {
+                        if let Some(digest) = parse_imagetools_digest(&output.stdout) {
+                            tracing::info!(image = %image, "Found image through Docker registry login");
+                            return Ok(digest);
+                        }
+                    }
+                    Ok(output) => {
+                        tracing::warn!(image = %image, status = %output.status, "Docker registry lookup failed");
+                    }
+                    Err(command_error) => {
+                        tracing::warn!(image = %image, error = %command_error, "Could not run Docker registry lookup");
+                    }
+                }
+                Err(error)
+            }
+            result => result,
+        }
     }
+}
+
+fn parse_imagetools_digest(stdout: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stdout).lines().find_map(|line| {
+        line.strip_prefix("Digest:")
+            .map(str::trim)
+            .filter(|digest| !digest.is_empty())
+            .map(str::to_owned)
+    })
 }
 
 impl HttpClient for RealHttpClient {
@@ -451,6 +487,16 @@ fn auth_type_name(auth: &RegistryAuth) -> &'static str {
 mod tests {
     use super::*;
     use mockall::predicate::*;
+
+    #[test]
+    fn parses_docker_imagetools_digest() {
+        let output = b"Name: spatialdev.azurecr.io/expgen-server:0.6.52\nMediaType: application/vnd.oci.image.index.v1+json\nDigest: sha256:abc123\n";
+        assert_eq!(
+            parse_imagetools_digest(output).as_deref(),
+            Some("sha256:abc123")
+        );
+        assert_eq!(parse_imagetools_digest(b"Name: image:tag\n"), None);
+    }
 
     // Test helper to create Docker with mocked dependencies
     fn create_test_docker(
