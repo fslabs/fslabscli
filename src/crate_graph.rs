@@ -400,6 +400,59 @@ impl CrateGraph {
     }
 }
 
+/// Cargo omits dev-dependencies without an explicit version, including path
+/// dependencies with a registry field. Metadata represents both omission and
+/// an explicit wildcard as `*`, so consult the declaration in that case.
+fn published_dependency(
+    package: &Package,
+    dependency: &cargo_metadata::Dependency,
+) -> anyhow::Result<bool> {
+    if dependency.kind != DependencyKind::Development || dependency.req.to_string() != "*" {
+        return Ok(true);
+    }
+    let manifest: toml::Value = toml::from_str(&std::fs::read_to_string(&package.manifest_path)?)?;
+    let name = dependency.rename.as_deref().unwrap_or(&dependency.name);
+    let mut tables = vec![&manifest];
+    if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+        tables.extend(targets.values());
+    }
+    for table in tables {
+        let Some(declaration) = table
+            .get("dev-dependencies")
+            .and_then(|deps| deps.get(name))
+        else {
+            continue;
+        };
+        if declaration.is_str() || declaration.get("version").is_some() {
+            return Ok(true);
+        }
+        if declaration.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+            for parent in package
+                .manifest_path
+                .as_std_path()
+                .parent()
+                .unwrap()
+                .ancestors()
+            {
+                let path = parent.join("Cargo.toml");
+                if !path.exists() {
+                    continue;
+                }
+                let inherited: toml::Value = toml::from_str(&std::fs::read_to_string(path)?)?;
+                if let Some(workspace) = inherited.get("workspace") {
+                    let value = workspace
+                        .get("dependencies")
+                        .and_then(|deps| deps.get(name))
+                        .ok_or_else(|| anyhow::anyhow!("Missing workspace dependency {name}"))?;
+                    return Ok(value.is_str() || value.get("version").is_some());
+                }
+            }
+            anyhow::bail!("Missing workspace for dependency {name}");
+        }
+    }
+    Ok(false)
+}
+
 /// A crate that either:
 ///
 /// - is not a workspace member (a standalone package)
@@ -635,6 +688,44 @@ impl DependencyGraph {
             }
         }
         visited
+    }
+
+    /// Publication excludes unversioned dev-dependencies, as Cargo packaging does.
+    /// Never propagate a registry into a dependency that forbids that destination.
+    pub fn get_publish_dependencies(
+        &self,
+        root: PackageId,
+        registry: Option<&str>,
+    ) -> anyhow::Result<HashSet<PackageId>> {
+        let mut visited = HashSet::new();
+        let mut pending = vec![root];
+        while let Some(id) = pending.pop() {
+            let package = &self.id_to_package[&id];
+            if let Some(allowed) = &package.publish
+                && (allowed.is_empty() || registry.is_some_and(|r| !allowed.iter().any(|a| a == r)))
+            {
+                anyhow::bail!(
+                    "Package {} forbids publication to {:?}",
+                    package.name,
+                    registry
+                );
+            }
+            for edge in self.dependencies.get(&id).into_iter().flatten() {
+                let dependency = &self.id_to_package[&edge.package_id];
+                let included = package
+                    .dependencies
+                    .iter()
+                    .filter(|d| dependency.name == d.name)
+                    .map(|d| published_dependency(package, d))
+                    .collect::<anyhow::Result<Vec<_>>>()?
+                    .into_iter()
+                    .any(|included| included);
+                if included && visited.insert(edge.package_id.clone()) {
+                    pending.push(edge.package_id.clone());
+                }
+            }
+        }
+        Ok(visited)
     }
 
     pub fn detect_cycles(&self) -> Option<Vec<PackageId>> {
@@ -990,6 +1081,111 @@ mod tests {
         commit_repo(&tmp, "Added new function");
         tmp
     }
+    #[test]
+    fn publication_dependencies_respect_cargo_package_and_registry_rules() {
+        let root = assert_fs::TempDir::new().unwrap();
+        std::fs::create_dir(root.join(".cargo")).unwrap();
+        std::fs::write(
+            root.join(".cargo/config.toml"),
+            r#"[registries.private]
+index = "sparse+https://registry.invalid/"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            r#"
+[workspace]
+members = ["app", "runtime", "helper", "versioned", "wildcard"]
+resolver = "2"
+[workspace.dependencies]
+wildcard = { path = "wildcard", version = "*" }
+"#,
+        )
+        .unwrap();
+        for name in ["app", "runtime", "helper", "versioned", "wildcard"] {
+            std::fs::create_dir_all(root.join(name).join("src")).unwrap();
+            std::fs::write(root.join(name).join("src/lib.rs"), "").unwrap();
+            let policy = if name == "helper" {
+                "false"
+            } else {
+                "[\"private\"]"
+            };
+            let mut manifest =
+                format!("[package]\nname=\"{name}\"\nversion=\"1.0.0\"\npublish={policy}\n");
+            if name == "app" {
+                manifest.push_str(
+                    r#"
+[dependencies]
+runtime = { path = "../runtime", version = "1.0.0" }
+[dev-dependencies]
+helper = { path = "../helper", registry = "private" }
+renamed = { package = "versioned", path = "../versioned", version = "1.0.0" }
+[target.'cfg(unix)'.dev-dependencies]
+wildcard.workspace = true
+"#,
+                );
+            }
+            std::fs::write(root.join(name).join("Cargo.toml"), manifest).unwrap();
+        }
+        let metadata = MetadataCommand::new()
+            .current_dir(root.path())
+            .manifest_path(root.join("Cargo.toml"))
+            .other_options(vec!["--offline".into()])
+            .exec()
+            .unwrap();
+        let id = metadata
+            .packages
+            .iter()
+            .find(|p| p.name == "app")
+            .unwrap()
+            .id
+            .clone();
+        let helper = metadata
+            .packages
+            .iter()
+            .find(|p| p.name == "helper")
+            .unwrap()
+            .id
+            .clone();
+        let workspace = Workspace {
+            path: PathBuf::from("."),
+            metadata,
+            default_metadata: None,
+        };
+        let mut graph = DependencyGraph::new(root.path(), &[workspace], None, false);
+        let selected = graph
+            .get_publish_dependencies(id.clone(), Some("private"))
+            .unwrap();
+        let names: HashSet<_> = selected
+            .iter()
+            .map(|id| graph.id_to_package[id].name.as_str())
+            .collect();
+        assert_eq!(names, HashSet::from(["runtime", "versioned", "wildcard"]));
+        // Even a root that permits public publication cannot expand the
+        // destination of a private dependency.
+        graph.id_to_package.get_mut(&id).unwrap().publish = None;
+        assert!(
+            graph
+                .get_publish_dependencies(id.clone(), Some("crates-io"))
+                .is_err()
+        );
+        let required = graph
+            .id_to_package
+            .iter()
+            .find(|(_, p)| p.name == "versioned")
+            .unwrap()
+            .0
+            .clone();
+        graph.id_to_package.get_mut(&required).unwrap().publish = Some(vec![]);
+        assert!(graph.get_publish_dependencies(id, Some("private")).is_err());
+        assert!(
+            graph
+                .get_publish_dependencies(helper, Some("private"))
+                .is_err()
+        );
+    }
+
     #[test]
     fn test_get_transitive_dependencies() {
         // Set up a simple graph

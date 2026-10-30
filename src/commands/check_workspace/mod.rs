@@ -1101,7 +1101,7 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
                 tag_scope.extend(
                     crates
                         .dependency_graph()
-                        .get_transitive_dependencies(package_id),
+                        .get_publish_dependencies(package_id, None)?,
                 );
             }
         }
@@ -1110,7 +1110,7 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
             marked_cargo_scope.extend(
                 crates
                     .dependency_graph()
-                    .get_transitive_dependencies(package_id),
+                    .get_publish_dependencies(package_id, None)?,
             );
         }
         for (package_id, package) in &mut packages {
@@ -1228,15 +1228,23 @@ impl<'a, C: CrateChecker> WorkspaceChecker<'a, C> {
 
         let mut all_packages_registries: HashSet<String> = HashSet::new();
         for (package_key, registries) in cargo_roots {
+            // Public publication must respect every original manifest, even
+            // when the destination came from metadata instead of a CLI flag.
+            if registries.iter().any(|registry| registry == CRATES_IO) {
+                crates
+                    .dependency_graph()
+                    .get_publish_dependencies(package_key.clone(), Some(CRATES_IO))?;
+            }
             all_packages_registries.extend(registries.clone());
             if let Some(package) = packages.get_mut(&package_key) {
                 package.cargo_selected = true;
                 package.cargo_root = true;
             }
 
-            let transitive_dependencies = crates
-                .dependency_graph()
-                .get_transitive_dependencies(package_key);
+            let transitive_dependencies = crates.dependency_graph().get_publish_dependencies(
+                package_key,
+                self.common_options.cargo_target_registry.as_deref(),
+            )?;
             for dep_id in transitive_dependencies {
                 if let Some(dep) = packages.get_mut(&dep_id) {
                     let mut dep_registries = dep
@@ -1573,6 +1581,37 @@ mod tests {
                 .install_default()
                 .ok(); // Ignore error if already installed
         });
+    }
+
+    #[tokio::test]
+    async fn public_registry_cannot_override_private_manifests() {
+        init_crypto_provider();
+        for public_root in [false, true] {
+            let ws = create_complex_workspace(false);
+            let path = ws.join("crates_g/Cargo.toml");
+            let mut manifest = std::fs::read_to_string(&path).unwrap();
+            manifest.push_str("\nallow_public = true\n");
+            if public_root {
+                manifest = manifest.replace(
+                    "publish = [\"fake-registry\"]",
+                    "publish = [\"fake-registry\", \"crates-io\"]",
+                );
+            }
+            std::fs::write(path, manifest).unwrap();
+            let options = Options::new();
+            let common = PackageRelatedOptions {
+                whitelist: vec!["crates_g".into()],
+                ..Default::default()
+            };
+            // No registry calls are permitted before this policy check.
+            let result = WorkspaceChecker::new(&common, &options, ws, MockCargo::new())
+                .check_workspace()
+                .await;
+            let error = result
+                .err()
+                .expect("private publication policy must reject crates.io");
+            assert!(error.to_string().contains("forbids publication"));
+        }
     }
 
     #[tokio::test]
