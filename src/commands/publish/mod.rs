@@ -1774,6 +1774,9 @@ async fn do_publish_package(params: DoPublishParams) -> PublishResult {
                     ));
                 }
             }
+            for (id, variable) in &package.publish_detail.docker.secrets {
+                args.push(format!("--secret id={id},env={variable}"));
+            }
             args.push(context.clone());
             // First we build
             let command_output = Script::new(
